@@ -1,0 +1,9 @@
+# cfg/custom_config.yaml
+defaults:
+  - env: env.yaml
+  - task: task.yaml
+  - train: train.yaml
+
+run_name: "example_run"
+checkpoint: "path/to/checkpoint"
+test: false
