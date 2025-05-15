@@ -1,1371 +1,927 @@
-# Modified from:
-# https://github.com/Denys88/rl_games/blob/master/rl_games/algos_torch/a2c_continuous.py &
-# https://github.com/Denys88/rl_games/blob/master/rl_games/common/a2c_common.py
-
-# MIT License
-
-# Copyright (c) 2019 Denys88
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
-import copy
-import os
-import numpy as np
+import sys
+import warnings
 import time
+from collections import deque
+from typing import Any, ClassVar, Optional, TypeVar, Union
 
+import numpy as np
 import torch
-from torch import optim
-from torch import nn
-import torch.distributed as dist
-import gym
-from datetime import datetime
-from tensorboardX import SummaryWriter
-from scipy.stats import linregress
-
-from rl_games.algos_torch.moving_mean_std import GeneralizedMovingStats
-from rl_games.algos_torch.self_play_manager import SelfPlayManager
-from rl_games.algos_torch import torch_ext
-from rl_games.algos_torch import central_value
-from rl_games.algos_torch import model_builder
-from rl_games.common import common_losses
-from rl_games.common import datasets
-from rl_games.common import vecenv
-from rl_games.common import schedulers
-
-from rl_games.common.experience import ExperienceBuffer
-from rl_games.common.interval_summary_writer import IntervalSummaryWriter
-from rl_games.common.diagnostics import DefaultDiagnostics, PpoDiagnostics
-from rl_games.interfaces.base_algorithm import BaseAlgorithm
-
-def swap_and_flatten01(arr):
-    """
-    swap and then flatten axes 0 and 1
-    """
-    if arr is None:
-        return arr
-    s = arr.size()
-    return arr.transpose(0, 1).reshape(s[0] * s[1], *s[2:])
-
-def rescale_actions(low, high, action):
-    d = (high - low) / 2.0
-    m = (high + low) / 2.0
-    scaled_action = action * d + m
-    return scaled_action
-
-def print_statistics(print_stats, curr_frames, step_time, step_inference_time, total_time, epoch_num, max_epochs, frame, max_frames):
-    if print_stats:
-        step_time = max(step_time, 1e-9)
-        fps_step = curr_frames / step_time
-        fps_step_inference = curr_frames / step_inference_time
-        fps_total = curr_frames / total_time
-
-        if max_epochs == -1 and max_frames == -1:
-            print(f'fps step: {fps_step:.0f} fps step and policy inference: {fps_step_inference:.0f} fps total: {fps_total:.0f} epoch: {epoch_num:.0f} frames: {frame:.0f}')
-        elif max_epochs == -1:
-            print(f'fps step: {fps_step:.0f} fps step and policy inference: {fps_step_inference:.0f} fps total: {fps_total:.0f} epoch: {epoch_num:.0f} frames: {frame:.0f}/{max_frames:.0f}')
-        elif max_frames == -1:
-            print(f'fps step: {fps_step:.0f} fps step and policy inference: {fps_step_inference:.0f} fps total: {fps_total:.0f} epoch: {epoch_num:.0f}/{max_epochs:.0f} frames: {frame:.0f}')
-        else:
-            print(f'fps step: {fps_step:.0f} fps step and policy inference: {fps_step_inference:.0f} fps total: {fps_total:.0f} epoch: {epoch_num:.0f}/{max_epochs:.0f} frames: {frame:.0f}/{max_frames:.0f}')
-
-class MTPPO(BaseAlgorithm):
-    """
-    Continuous multi-task PPO Agent
-    """
-
-    def __init__(self, base_name, params):
-        self.config = config = params['config']
-        pbt_str = ''
-        self.population_based_training = config.get('population_based_training', False)
-        if self.population_based_training:
-            # in PBT, make sure experiment name contains a unique id of the policy within a population
-            pbt_str = f'_pbt_{config["pbt_idx"]:02d}'
-
-        # This helps in PBT when we need to restart an experiment with the exact same name, rather than
-        # generating a new name with the timestamp every time.
-        full_experiment_name = config.get('full_experiment_name', None)
-        if full_experiment_name:
-            print(f'Exact experiment name requested from command line: {full_experiment_name}')
-            self.experiment_name = full_experiment_name
-        else:
-            self.experiment_name = config['name'] + pbt_str + datetime.now().strftime("_%d-%H-%M-%S")
-
-        self.config = config
-        self.algo_observer = config['features']['observer']
-        self.algo_observer.before_init(base_name, config, self.experiment_name)
-        self.load_networks(params)
-
-        self.multi_gpu = config.get('multi_gpu', False)
-
-        # multi-gpu/multi-node data
-        self.local_rank = 0
-        self.global_rank = 0
-        self.world_size = 1
-
-        self.curr_frames = 0
-
-        if self.multi_gpu:
-            # local rank of the GPU in a node
-            self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
-            # global rank of the GPU
-            self.global_rank = int(os.getenv("RANK", "0"))
-            # total number of GPUs across all nodes
-            self.world_size = int(os.getenv("WORLD_SIZE", "1"))
-
-            dist.init_process_group("nccl", rank=self.global_rank, world_size=self.world_size)
-
-            self.device_name = 'cuda:' + str(self.local_rank)
-            config['device'] = self.device_name
-            if self.global_rank != 0:
-                config['print_stats'] = False
-                config['lr_schedule'] = None
-
-        self.use_diagnostics = config.get('use_diagnostics', False)
-
-        if self.use_diagnostics and self.global_rank == 0:
-            self.diagnostics = PpoDiagnostics()
-        else:
-            self.diagnostics = DefaultDiagnostics()
-
-        self.network_path = config.get('network_path', "./nn/")
-        self.log_path = config.get('log_path', "runs/")
-        self.env_config = config.get('env_config', {})
-        self.num_actors = config['num_actors']
-        self.env_name = config['env_name']
-
-        self.vec_env = None
-        self.env_info = config.get('env_info')
-        if self.env_info is None:
-            self.vec_env = vecenv.create_vec_env(self.env_name, self.num_actors, **self.env_config)
-            self.env_info = self.vec_env.get_env_info()
-        else:
-            self.vec_env = config.get('vec_env', None)
-
-        # multi-task
-        self.num_tasks = self.vec_env.num_tasks
-        self.task_idx = self.vec_env.task_idx
-
-        self.ppo_device = config.get('device', 'cuda:0')
-        self.value_size = self.env_info.get('value_size',1)
-        self.observation_space = self.env_info['observation_space']
-        self.weight_decay = config.get('weight_decay', 0.0)
-        self.use_action_masks = config.get('use_action_masks', False)
-        self.is_train = config.get('is_train', True)
-
-        self.central_value_config = self.config.get('central_value_config', None)
-        self.has_central_value = self.central_value_config is not None
-        self.truncate_grads = self.config.get('truncate_grads', False)
-
-        if self.has_central_value:
-            self.state_space = self.env_info.get('state_space', None)
-            if isinstance(self.state_space,gym.spaces.Dict):
-                self.state_shape = {}
-                for k,v in self.state_space.spaces.items():
-                    self.state_shape[k] = v.shape
-            else:
-                self.state_shape = self.state_space.shape
-
-        self.self_play_config = self.config.get('self_play_config', None)
-        self.has_self_play_config = self.self_play_config is not None
-
-        self.self_play = config.get('self_play', False)
-        self.save_freq = config.get('save_frequency', 0)
-        self.save_best_after = config.get('save_best_after', 100)
-        self.print_stats = config.get('print_stats', True)
-        self.rnn_states = None
-        self.name = base_name
-
-        # TODO: do we still need it?
-        self.ppo = config.get('ppo', True)
-        self.max_epochs = self.config.get('max_epochs', -1)
-        self.max_frames = self.config.get('max_frames', -1)
-
-        self.is_adaptive_lr = config['lr_schedule'] == 'adaptive'
-        self.linear_lr = config['lr_schedule'] == 'linear'
-        self.schedule_type = config.get('schedule_type', 'legacy')
-
-        # Setting learning rate scheduler
-        if self.is_adaptive_lr:
-            self.kl_threshold = config['kl_threshold']
-            self.scheduler = schedulers.AdaptiveScheduler(self.kl_threshold)
-
-        elif self.linear_lr:
-            
-            if self.max_epochs == -1 and self.max_frames == -1:
-                print("Max epochs and max frames are not set. Linear learning rate schedule can't be used, switching to the contstant (identity) one.")
-                self.scheduler = schedulers.IdentityScheduler()
-            else:
-                use_epochs = True
-                max_steps = self.max_epochs
-
-                if self.max_epochs == -1:
-                    use_epochs = False
-                    max_steps = self.max_frames
-
-                self.scheduler = schedulers.LinearScheduler(float(config['learning_rate']), 
-                    max_steps = max_steps,
-                    use_epochs = use_epochs, 
-                    apply_to_entropy = config.get('schedule_entropy', False),
-                    start_entropy_coef = config.get('entropy_coef'))
-        else:
-            self.scheduler = schedulers.IdentityScheduler()
-
-        self.e_clip = config['e_clip']
-        self.clip_value = config['clip_value']
-        self.network = config['network']
-        self.rewards_shaper = config['reward_shaper']
-        self.num_agents = self.env_info.get('agents', 1)
-        self.horizon_length = config['horizon_length']
-
-        # seq_length is used only with rnn policy and value functions
-        if 'seq_len' in config:
-            print('WARNING: seq_len is deprecated, use seq_length instead')
-
-        self.seq_length = self.config.get('seq_length', 4)
-        print('seq_length:', self.seq_length)
-        self.bptt_len = self.config.get('bptt_length', self.seq_length) # not used right now. Didn't show that it is usefull
-        self.zero_rnn_on_done = self.config.get('zero_rnn_on_done', True)
-
-        self.normalize_advantage = config['normalize_advantage']
-        self.normalize_rms_advantage = config.get('normalize_rms_advantage', False)
-        self.normalize_input = self.config['normalize_input']
-        self.normalize_value = self.config.get('normalize_value', False)
-        self.truncate_grads = self.config.get('truncate_grads', False)
-
-        if isinstance(self.observation_space, gym.spaces.Dict):
-            self.obs_shape = {}
-            for k,v in self.observation_space.spaces.items():
-                self.obs_shape[k] = v.shape
-        else:
-            self.obs_shape = self.observation_space.shape
- 
-        self.critic_coef = config['critic_coef']
-        self.grad_norm = config['grad_norm']
-        self.gamma = self.config['gamma']
-        self.tau = self.config['tau']
-
-        self.games_to_track = self.config.get('games_to_track', 100)
-        print('current training device:', self.ppo_device)
-        self.game_rewards = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
-        self.game_shaped_rewards = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
-        self.game_lengths = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
-        self.obs = None
-        self.games_num = self.config['minibatch_size'] // self.seq_length # it is used only for current rnn implementation
-
-        self.batch_size = self.horizon_length * self.num_actors * self.num_agents
-        self.batch_size_envs = self.horizon_length * self.num_actors
-
-        assert(('minibatch_size_per_env' in self.config) or ('minibatch_size' in self.config))
-        self.minibatch_size_per_env = self.config.get('minibatch_size_per_env', 0)
-        self.minibatch_size = self.config.get('minibatch_size', self.num_actors * self.minibatch_size_per_env)
-
-        self.num_minibatches = self.batch_size // self.minibatch_size
-        assert(self.batch_size % self.minibatch_size == 0)
-
-        self.mini_epochs_num = self.config['mini_epochs']
-
-        self.mixed_precision = self.config.get('mixed_precision', False)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.mixed_precision)
-
-        self.last_lr = self.config['learning_rate']
-        self.frame = 0
-        self.update_time = 0
-        self.mean_rewards = self.last_mean_rewards = -1000000000
-        self.play_time = 0
-        self.epoch_num = 0
-        self.curr_frames = 0
-        # allows us to specify a folder where all experiments will reside
-        self.train_dir = config.get('train_dir', 'runs')
-
-        # a folder inside of train_dir containing everything related to a particular experiment
-        self.experiment_dir = os.path.join(self.train_dir, self.experiment_name)
-
-        # folders inside <train_dir>/<experiment_dir> for a specific purpose
-        self.nn_dir = os.path.join(self.experiment_dir, 'nn')
-        self.summaries_dir = os.path.join(self.experiment_dir, 'summaries')
-
-        os.makedirs(self.train_dir, exist_ok=True)
-        os.makedirs(self.experiment_dir, exist_ok=True)
-        os.makedirs(self.nn_dir, exist_ok=True)
-        os.makedirs(self.summaries_dir, exist_ok=True)
-
-        self.entropy_coef = self.config['entropy_coef']
-
-        if self.global_rank == 0:
-            writer = SummaryWriter(self.summaries_dir)
-            if self.population_based_training:
-                self.writer = IntervalSummaryWriter(writer, self.config)
-            else:
-                self.writer = writer
-        else:
-            self.writer = None
-
-        self.value_bootstrap = self.config.get('value_bootstrap')
-        self.use_smooth_clamp = self.config.get('use_smooth_clamp', False)
-
-        if self.use_smooth_clamp:
-            self.actor_loss_func = common_losses.smoothed_actor_loss
-        else:
-            self.actor_loss_func = common_losses.actor_loss
-
-        if self.normalize_advantage and self.normalize_rms_advantage:
-            momentum = self.config.get('adv_rms_momentum', 0.5)
-            self.advantage_mean_std = GeneralizedMovingStats((1,), momentum=momentum).to(self.ppo_device)
-
-        self.is_tensor_obses = False
-
-        self.last_rnn_indices = None
-        self.last_state_indices = None
-
-        #self_play
-        if self.has_self_play_config:
-            print('Initializing SelfPlay Manager')
-            self.self_play_manager = SelfPlayManager(self.self_play_config, self.writer)
-
-        # features
-        self.algo_observer = config['features']['observer']
-
-        self.soft_aug = config['features'].get('soft_augmentation', None)
-        self.has_soft_aug = self.soft_aug is not None
-        # soft augmentation not yet supported
-        assert not self.has_soft_aug
-        # ====== #
-
-        self.is_discrete = False
-        action_space = self.env_info['action_space']
-        self.actions_num = action_space.shape[0]
-        self.bounds_loss_coef = self.config.get('bounds_loss_coef', None)
-
-        self.clip_actions = self.config.get('clip_actions', True)
-
-        # todo introduce device instead of cuda()
-        self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
-        self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
-        
-        # ====== #
-         
-        obs_shape = self.obs_shape
-        build_config = {
-            'actions_num' : self.actions_num,
-            'input_shape' : obs_shape,
-            'num_seqs' : self.num_actors * self.num_agents,
-            'value_size': self.env_info.get('value_size',1),
-            'normalize_value' : self.normalize_value,
-            'normalize_input': self.normalize_input,
-        }
-        
-        self.model = self.network.build(build_config)
-        self.model.to(self.ppo_device)
-        self.states = None
-        self.init_rnn_from_model(self.model)
-        self.last_lr = float(self.last_lr)
-        self.bound_loss_type = self.config.get('bound_loss_type', 'bound') # 'regularisation' or 'bound'
-        self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
-
-        if self.has_central_value:
-            cv_config = {
-                'state_shape' : self.state_shape, 
-                'value_size' : self.value_size,
-                'ppo_device' : self.ppo_device, 
-                'num_agents' : self.num_agents, 
-                'horizon_length' : self.horizon_length,
-                'num_actors' : self.num_actors, 
-                'num_actions' : self.actions_num, 
-                'seq_length' : self.seq_length,
-                'normalize_value' : self.normalize_value,
-                'network' : self.central_value_config['network'],
-                'config' : self.central_value_config, 
-                'writter' : self.writer,
-                'max_epochs' : self.max_epochs,
-                'multi_gpu' : self.multi_gpu,
-                'zero_rnn_on_done' : self.zero_rnn_on_done
-            }
-            self.central_value_net = central_value.CentralValueTrain(**cv_config).to(self.ppo_device)
-
-        self.use_experimental_cv = self.config.get('use_experimental_cv', True)
-        self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_length)
-        if self.normalize_value:
-            self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
-
-        self.has_value_loss = self.use_experimental_cv or not self.has_central_value
-        self.algo_observer.after_init(self)
-
-    def trancate_gradients_and_step(self):
-        if self.multi_gpu:
-            # batch allreduce ops: see https://github.com/entity-neural-network/incubator/pull/220
-            all_grads_list = []
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    all_grads_list.append(param.grad.view(-1))
-
-            all_grads = torch.cat(all_grads_list)
-            dist.all_reduce(all_grads, op=dist.ReduceOp.SUM)
-            offset = 0
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.data.copy_(
-                        all_grads[offset : offset + param.numel()].view_as(param.grad.data) / self.world_size
-                    )
-                    offset += param.numel()
-
-        if self.truncate_grads:
-            self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-
-    def load_networks(self, params):
-        builder = model_builder.ModelBuilder()
-        self.config['network'] = builder.load(params)
-        has_central_value_net = self.config.get('central_value_config') is not  None
-        if has_central_value_net:
-            print('Adding Central Value Network')
-            if 'model' not in params['config']['central_value_config']:
-                params['config']['central_value_config']['model'] = {'name': 'central_value'}
-            network = builder.load(params['config']['central_value_config'])
-            self.config['central_value_config']['network'] = network
-
-    def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames):
-        # do we need scaled time?
-        self.diagnostics.send_info(self.writer)
-        self.writer.add_scalar('performance/step_inference_rl_update_fps', curr_frames / scaled_time, frame)
-        self.writer.add_scalar('performance/step_inference_fps', curr_frames / scaled_play_time, frame)
-        self.writer.add_scalar('performance/step_fps', curr_frames / step_time, frame)
-        self.writer.add_scalar('performance/rl_update_time', update_time, frame)
-        self.writer.add_scalar('performance/step_inference_time', play_time, frame)
-        self.writer.add_scalar('performance/step_time', step_time, frame)
-        self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(a_losses).item(), frame)
-        self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(c_losses).item(), frame)
-
-        self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), frame)
-        self.writer.add_scalar('info/last_lr', last_lr * lr_mul, frame)
-        self.writer.add_scalar('info/lr_mul', lr_mul, frame)
-        self.writer.add_scalar('info/e_clip', self.e_clip * lr_mul, frame)
-        self.writer.add_scalar('info/kl', torch_ext.mean_list(kls).item(), frame)
-        self.writer.add_scalar('info/epochs', epoch_num, frame)
-        self.algo_observer.after_print_stats(frame, epoch_num, total_time)
-
-    def set_eval(self):
-        self.model.eval()
-        if self.normalize_rms_advantage:
-            self.advantage_mean_std.eval()
-
-    def set_train(self):
-        self.model.train()
-        if self.normalize_rms_advantage:
-            self.advantage_mean_std.train()
-
-    def update_lr(self, lr):
-        if self.multi_gpu:
-            lr_tensor = torch.tensor([lr], device=self.device)
-            dist.broadcast(lr_tensor, 0)
-            lr = lr_tensor.item()
-
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        #if self.has_central_value:
-        #    self.central_value_net.update_lr(lr)
-
-    def get_action_values(self, obs):
-        processed_obs = self._preproc_obs(obs['obs'])
-        self.model.eval()
-        input_dict = {
-            'is_train': False,
-            'prev_actions': None, 
-            'obs' : processed_obs,
-            'rnn_states' : self.rnn_states
-        }
-
-        with torch.no_grad():
-            res_dict = self.model(input_dict)
-            if self.has_central_value:
-                states = obs['states']
-                input_dict = {
-                    'is_train': False,
-                    'states' : states,
-                }
-                value = self.get_central_value(input_dict)
-                res_dict['values'] = value
-        return res_dict
-
-    def get_values(self, obs):
-        with torch.no_grad():
-            if self.has_central_value:
-                states = obs['states']
-                self.central_value_net.eval()
-                input_dict = {
-                    'is_train': False,
-                    'states' : states,
-                    'actions' : None,
-                    'is_done': self.dones,
-                }
-                value = self.get_central_value(input_dict)
-            else:
-                self.model.eval()
-                processed_obs = self._preproc_obs(obs['obs'])
-                input_dict = {
-                    'is_train': False,
-                    'prev_actions': None, 
-                    'obs' : processed_obs,
-                    'rnn_states' : self.rnn_states
-                }
-                result = self.model(input_dict)
-                value = result['values']
-            return value
+import gymnasium as gym
+from torch.nn import functional as F
+from gymnasium import spaces
+from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
+from stable_baselines3.common.utils import check_for_correct_spaces, explained_variance, get_schedule_fn, configure_logger, obs_as_tensor, safe_mean, update_learning_rate, configure_logger, set_random_seed, get_system_info
+from stable_baselines3.common.save_util import load_from_zip_file, recursive_getattr, recursive_setattr, save_to_zip_file
+from stable_baselines3.common.vec_env.patch_gym import _convert_space, _patch_env
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
+# from rl_library.policies import ActorCriticPolicy
+from algos.policies import ActorCriticPolicy
+SelfPPO = TypeVar("SelfPPO", bound="PPO")
+
+
+class PPO:
     
-    @property
-    def device(self):
-        return self.ppo_device
+    def __init__(
+            self,
+            policy,
+            env,
+            learning_rate: float = 3e-4,
+            n_steps: int = 2048,
+            batch_size: int = 64,
+            n_epochs: int = 10,
+            gamma: float = 0.99,
+            gae_lambda: float = 0.95,
+            clip_range: float = 0.2,
+            clip_range_vf: float = None,
+            normalize_advantage: bool = True,
+            ent_coef: float = 0.0,
+            vf_coef: float = 0.5,
+            max_grad_norm: float = 0.5,
+            rollout_buffer_class = None,
+            rollout_buffer_kwargs = None,
+            target_kl: float = None,
+            stats_window_size: int = 100,
+            tensorboard_log: str = None,
+            policy_kwargs = None,
+            verbose: int = 0,
+            seed: int = None,
+            device = "cuda",
+            _init_setup_model: bool = True,
+            monitor_wrapper: bool = True,
+    ):
+        
+        self.device = torch.device(device)
+        self.policy_class = policy
+        self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
 
-    def reset_envs(self):
-        self.obs = self.env_reset()
+        self.num_timesteps = 0
+        # Used for updating schedules
+        self._total_timesteps = 0
+        # Used for computing fps, it is updated at each call of learn()
+        self._num_timesteps_at_start = 0
+        self.seed = seed
+        self.verbose = verbose
+        self.action_noise = None
+        self.start_time = 0.0
+        self.learning_rate = learning_rate
+        self.tensorboard_log = tensorboard_log
+        self._last_obs = None  
+        self._last_episode_starts = None
+        # When using VecNormalize:
+        self._last_original_obs = None
+        self._episode_num = 0
+        # Track the training progress remaining (from 1 to 0)
+        # this is used to update the learning rate
+        self._current_progress_remaining = 1.0
+        # Buffers for logging
+        self._stats_window_size = stats_window_size
+        self.ep_info_buffer = None  
+        self.ep_success_buffer = None 
+        # For logging (and TD3 delayed updates)
+        self._n_updates = 0  # type: int
+        # Whether the user passed a custom logger or not
+        self._custom_logger = False
+        self.env = None
+        self._vec_normalize_env = None
 
-    def init_rnn_from_model(self, model):
-        self.is_rnn = self.model.is_rnn()
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+        self.n_envs = env.n_envs
+        self.env = env
 
-    def cast_obs(self, obs):
-        if isinstance(obs, torch.Tensor):
-            self.is_tensor_obses = True
-        elif isinstance(obs, np.ndarray):
-            assert(obs.dtype != np.int8)
-            if obs.dtype == np.uint8:
-                obs = torch.ByteTensor(obs).to(self.ppo_device)
-            else:
-                obs = torch.FloatTensor(obs).to(self.ppo_device)
-        return obs
+        if isinstance(self.action_space, spaces.Box):
+            assert np.all(
+                np.isfinite(np.array([self.action_space.low, self.action_space.high]))
+            ), "Continuous action space must have a finite lower and upper bound"
 
-    def obs_to_tensors(self, obs):
-        obs_is_dict = isinstance(obs, dict)
-        if obs_is_dict:
-            upd_obs = {}
-            for key, value in obs.items():
-                upd_obs[key] = self._obs_to_tensors_internal(value)
-        else:
-            upd_obs = self.cast_obs(obs)
-        if not obs_is_dict or 'obs' not in obs:    
-            upd_obs = {'obs' : upd_obs}
-        return upd_obs
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.ent_coef = ent_coef
+        self.vf_coef = vf_coef
+        self.max_grad_norm = max_grad_norm
+        self.rollout_buffer_class = rollout_buffer_class
+        self.rollout_buffer_kwargs = rollout_buffer_kwargs or {}
 
-    def _obs_to_tensors_internal(self, obs):
-        if isinstance(obs, dict):
-            upd_obs = {}
-            for key, value in obs.items():
-                upd_obs[key] = self._obs_to_tensors_internal(value)
-        else:
-            upd_obs = self.cast_obs(obs)
-        return upd_obs
-    
-    def soft_clamp(self, x, lower, upper):
-        return lower + torch.sigmoid(4 / (upper - lower) * (x - (lower + upper) / 2)) * (upper - lower)
+        if normalize_advantage:
+            assert (batch_size > 1), "`batch_size` must be greater than 1."
 
-    def preprocess_actions(self, actions):
-        if not self.is_tensor_obses:
-            actions = actions.cpu().numpy()
-        return actions
+        if self.env is not None:
+            # Check that `n_steps * n_envs > 1` to avoid NaN
+            # when doing advantage normalization
+            buffer_size = self.env.n_envs * self.n_steps
+            assert buffer_size > 1 or (
+                not normalize_advantage
+            ), f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.n_envs}"
+            # Check that the rollout buffer size is a multiple of the mini-batch size
+            untruncated_batches = buffer_size // batch_size
+            if buffer_size % batch_size > 0:
+                warnings.warn(
+                    f"You have specified a mini-batch size of {batch_size},"
+                    f" but because the `RolloutBuffer` is of size `n_steps * n_envs = {buffer_size}`,"
+                    f" after every {untruncated_batches} untruncated mini-batches,"
+                    f" there will be a truncated mini-batch of size {buffer_size % batch_size}\n"
+                    f"We recommend using a `batch_size` that is a factor of `n_steps * n_envs`.\n"
+                    f"Info: (n_steps={self.n_steps} and n_envs={self.env.n_envs})"
+                )
+        self.batch_size = batch_size
+        self.n_epochs = n_epochs
+        self.clip_range = clip_range
+        self.clip_range_vf = clip_range_vf
+        self.normalize_advantage = normalize_advantage
+        self.target_kl = target_kl
 
-    def env_step(self, actions):
-        actions = self.preprocess_actions(actions)
-        obs, rewards, dones, infos = self.vec_env.step(actions)
+        if _init_setup_model:
+            self._setup_model()
 
-        if self.is_tensor_obses:
-            if self.value_size == 1:
-                rewards = rewards.unsqueeze(1)
-            return self.obs_to_tensors(obs), rewards.to(self.ppo_device), dones.to(self.ppo_device), infos
-        else:
-            if self.value_size == 1:
-                rewards = np.expand_dims(rewards, axis=1)
-            return self.obs_to_tensors(obs), torch.from_numpy(rewards).to(self.ppo_device).float(), torch.from_numpy(dones).to(self.ppo_device), infos
+    def train(self) -> None:
+        """
+        Update policy using the currently gathered rollout buffer.
+        """ 
+        # Switch to train mode (this affects batch norm / dropout)
+        # self.policy.set_training_mode(True)
+        self.policy.train(True)
+        # Update optimizer learning rate
+        self._update_learning_rate(self.policy.optimizer)
+        # Compute current clip range
+        clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
+        # Optional: clip range for the value function
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
 
-    def env_reset(self):
-        obs = self.vec_env.reset()
-        obs = self.obs_to_tensors(obs)
-        return obs
+        entropy_losses = []
+        pg_losses, value_losses = [], []
+        clip_fractions = []
 
-    def discount_values(self, fdones, last_extrinsic_values, mb_fdones, mb_extrinsic_values, mb_rewards):
-        lastgaelam = 0
-        mb_advs = torch.zeros_like(mb_rewards)
+        continue_training = True
+        # train for n_epochs epochs
+        for epoch in range(self.n_epochs):
+            approx_kl_divs = []
+            # Do a complete pass on the rollout buffer
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
+                actions = rollout_data.actions
+                if isinstance(self.action_space, spaces.Discrete):
+                    # Convert discrete action from float to long
+                    actions = rollout_data.actions.long().flatten()
 
-        for t in reversed(range(self.horizon_length)):
-            if t == self.horizon_length - 1:
-                nextnonterminal = 1.0 - fdones
-                nextvalues = last_extrinsic_values
-            else:
-                nextnonterminal = 1.0 - mb_fdones[t+1]
-                nextvalues = mb_extrinsic_values[t+1]
-            nextnonterminal = nextnonterminal.unsqueeze(1)
-
-            delta = mb_rewards[t] + self.gamma * nextvalues * nextnonterminal - mb_extrinsic_values[t]
-            mb_advs[t] = lastgaelam = delta + self.gamma * self.tau * nextnonterminal * lastgaelam
-        return mb_advs
-
-    def discount_values_masks(self, fdones, last_extrinsic_values, mb_fdones, mb_extrinsic_values, mb_rewards, mb_masks):
-        lastgaelam = 0
-        mb_advs = torch.zeros_like(mb_rewards)
-        for t in reversed(range(self.horizon_length)):
-            if t == self.horizon_length - 1:
-                nextnonterminal = 1.0 - fdones
-                nextvalues = last_extrinsic_values
-            else:
-                nextnonterminal = 1.0 - mb_fdones[t+1]
-                nextvalues = mb_extrinsic_values[t+1]
-            nextnonterminal = nextnonterminal.unsqueeze(1)
-            masks_t = mb_masks[t].unsqueeze(1)
-            delta = (mb_rewards[t] + self.gamma * nextvalues * nextnonterminal  - mb_extrinsic_values[t])
-            mb_advs[t] = lastgaelam = (delta + self.gamma * self.tau * nextnonterminal * lastgaelam) * masks_t
-        return mb_advs
-
-    def clear_stats(self):
-        batch_size = self.num_agents * self.num_actors
-        self.game_rewards.clear()
-        self.game_shaped_rewards.clear()
-        self.game_lengths.clear()
-        self.mean_rewards = self.last_mean_rewards = -100500
-        self.algo_observer.after_clear_stats()
-
-    def preprocess_actions(self, actions):
-        if self.clip_actions:
-            clamped_actions = torch.clamp(actions, -1.0, 1.0)
-            rescaled_actions = rescale_actions(self.actions_low, self.actions_high, clamped_actions)
-        else:
-            rescaled_actions = actions
-
-        if not self.is_tensor_obses:
-            rescaled_actions = rescaled_actions.cpu().numpy()
-
-        return rescaled_actions
-
-    def init_tensors(self):
-        batch_size = self.num_agents * self.num_actors
-        algo_info = {
-            'num_actors' : self.num_actors,
-            'horizon_length' : self.horizon_length,
-            'has_central_value' : self.has_central_value,
-            'use_action_masks' : self.use_action_masks
-        }
-        self.experience_buffer = ExperienceBuffer(self.env_info, algo_info, self.ppo_device)
-
-        val_shape = (self.horizon_length, batch_size, self.value_size)
-        current_rewards_shape = (batch_size, self.value_size)
-        self.current_rewards = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
-        self.current_shaped_rewards = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
-        self.current_lengths = torch.zeros(batch_size, dtype=torch.float32, device=self.ppo_device)
-        self.dones = torch.ones((batch_size,), dtype=torch.uint8, device=self.ppo_device)
-
-        if self.is_rnn:
-            self.rnn_states = self.model.get_default_rnn_state()
-            self.rnn_states = [s.to(self.ppo_device) for s in self.rnn_states]
-
-            total_agents = self.num_agents * self.num_actors
-            num_seqs = self.horizon_length // self.seq_length
-            assert((self.horizon_length * total_agents // self.num_minibatches) % self.seq_length == 0)
-            self.mb_rnn_states = [torch.zeros((num_seqs, s.size()[0], total_agents, s.size()[2]), dtype = torch.float32, device=self.ppo_device) for s in self.rnn_states]
-
-        # ====== # 
-
-        self.update_list = ['actions', 'neglogpacs', 'values', 'mus', 'sigmas']
-        self.tensor_list = self.update_list + ['obses', 'states', 'dones']
-
-
-    def update_epoch(self):
-        self.epoch_num += 1
-        return self.epoch_num
-
-    def train_epoch(self):
-        self.vec_env.set_train_info(self.frame, self)
-
-        # ====== #
-
-        self.set_eval()
-        play_time_start = time.perf_counter()
-        with torch.no_grad():
-            if self.is_rnn:
-                batch_dict = self.play_steps_rnn()
-            else:
-                batch_dict = self.play_steps()
-
-        play_time_end = time.perf_counter()
-        update_time_start = time.perf_counter()
-        rnn_masks = batch_dict.get('rnn_masks', None)
-
-        self.set_train()
-        self.curr_frames = batch_dict.pop('played_frames')
-        self.prepare_dataset(batch_dict)
-        self.algo_observer.after_steps()
-        if self.has_central_value:
-            self.train_central_value()
-
-        a_losses = []
-        c_losses = []
-        b_losses = []
-        entropies = []
-        kls = []
-
-        for mini_ep in range(0, self.mini_epochs_num):
-            ep_kls = []
-            for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
-                a_losses.append(a_loss)
-                c_losses.append(c_loss)
-                ep_kls.append(kl)
-                entropies.append(entropy)
-                if self.bounds_loss_coef is not None:
-                    b_losses.append(b_loss)
-
-                self.dataset.update_mu_sigma(cmu, csigma)
-                if self.schedule_type == 'legacy':
-                    av_kls = kl
-                    if self.multi_gpu:
-                        dist.all_reduce(kl, op=dist.ReduceOp.SUM)
-                        av_kls /= self.world_size
-                    self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-                    self.update_lr(self.last_lr)
-
-            av_kls = torch_ext.mean_list(ep_kls)
-            if self.multi_gpu:
-                dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
-                av_kls /= self.world_size
-            if self.schedule_type == 'standard':
-                self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-                self.update_lr(self.last_lr)
-
-            kls.append(av_kls)
-            self.diagnostics.mini_epoch(self, mini_ep)
-            if self.normalize_input:
-                self.model.running_mean_std.eval() # don't need to update statstics more than one miniepoch
-
-        update_time_end = time.perf_counter()
-        play_time = play_time_end - play_time_start
-        update_time = update_time_end - update_time_start
-        total_time = update_time_end - play_time_start
-
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
-
-    def prepare_dataset(self, batch_dict):
-        obses = batch_dict['obses']
-        returns = batch_dict['returns']
-        dones = batch_dict['dones']
-        values = batch_dict['values']
-        actions = batch_dict['actions']
-        neglogpacs = batch_dict['neglogpacs']
-        mus = batch_dict['mus']
-        sigmas = batch_dict['sigmas']
-        rnn_states = batch_dict.get('rnn_states', None)
-        rnn_masks = batch_dict.get('rnn_masks', None)
-
-        advantages = returns - values
-
-        if self.normalize_value:
-            if self.config.get('freeze_critic', False):
-                self.value_mean_std.eval()
-            else:
-                self.value_mean_std.train()
-            values = self.value_mean_std(values)
-            returns = self.value_mean_std(returns)
-            self.value_mean_std.eval()
-
-        advantages = torch.sum(advantages, axis=1)
-
-        if self.normalize_advantage:
-            if self.is_rnn:
-                if self.normalize_rms_advantage:
-                    advantages = self.advantage_mean_std(advantages, mask=rnn_masks)
-                else:
-                    advantages = torch_ext.normalization_with_masks(advantages, rnn_masks)
-            else:
-                if self.normalize_rms_advantage:
-                    advantages = self.advantage_mean_std(advantages)
-                else:
+                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                values = values.flatten()
+                # Normalize advantage
+                advantages = rollout_data.advantages
+                # Normalization does not make sense if mini batchsize == 1, see GH issue #325
+                if self.normalize_advantage and len(advantages) > 1:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        dataset_dict = {}
-        dataset_dict['old_values'] = values
-        dataset_dict['old_logp_actions'] = neglogpacs
-        dataset_dict['advantages'] = advantages
-        dataset_dict['returns'] = returns
-        dataset_dict['actions'] = actions
-        dataset_dict['obs'] = obses
-        dataset_dict['dones'] = dones
-        dataset_dict['rnn_states'] = rnn_states
-        dataset_dict['rnn_masks'] = rnn_masks
-        dataset_dict['mu'] = mus
-        dataset_dict['sigma'] = sigmas
+                # ratio between old and new policy, should be one at the first iteration
+                ratio = torch.exp(log_prob - rollout_data.old_log_prob)
 
-        self.dataset.update_values_dict(dataset_dict)
+                # clipped surrogate loss
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
 
-        if self.has_central_value:
-            dataset_dict = {}
-            dataset_dict['old_values'] = values
-            dataset_dict['advantages'] = advantages
-            dataset_dict['returns'] = returns
-            dataset_dict['actions'] = actions
-            dataset_dict['obs'] = batch_dict['states']
-            dataset_dict['dones'] = dones
-            dataset_dict['rnn_masks'] = rnn_masks
-            self.central_value_net.update_dataset(dataset_dict)
+                # Logging
+                pg_losses.append(policy_loss.item())
+                clip_fraction = torch.mean((torch.abs(ratio - 1) > clip_range).float()).item()
+                clip_fractions.append(clip_fraction)
 
-    def train(self):
-        self.init_tensors()
-        self.last_mean_rewards = -100500
-        start_time = time.perf_counter()
-        total_time = 0
-        rep_count = 0
-        self.obs = self.env_reset()
-        self.curr_frames = self.batch_size_envs
+                if self.clip_range_vf is None:
+                    # No clipping
+                    values_pred = values
+                else:
+                    # Clip the difference between old and new value
+                    # NOTE: this depends on the reward scaling
+                    values_pred = rollout_data.old_values + torch.clamp(
+                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf
+                    )
+                # Value loss using the TD(gae_lambda) target
+                value_loss = F.mse_loss(rollout_data.returns, values_pred)
+                value_losses.append(value_loss.item())
 
-        if self.multi_gpu:
-            torch.cuda.set_device(self.local_rank)
-            print("====================broadcasting parameters")
-            model_params = [self.model.state_dict()]
-            if self.has_central_value:
-                model_params.append(self.central_value_net.state_dict())
-            dist.broadcast_object_list(model_params, 0)
-            self.model.load_state_dict(model_params[0])
-            if self.has_central_value:
-                self.central_value_net.load_state_dict(model_params[1])
+                # Entropy loss favor exploration
+                if entropy is None:
+                    # Approximate entropy when no analytical form
+                    entropy_loss = -torch.mean(-log_prob)
+                else:
+                    entropy_loss = -torch.mean(entropy)
 
-        while True:
-            epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
-            total_time += sum_time
-            frame = self.frame // self.num_agents
+                entropy_losses.append(entropy_loss.item())
 
-            # cleaning memory to optimize space
-            self.dataset.update_values_dict(None)
-            should_exit = False
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
-            if self.global_rank == 0:
-                self.diagnostics.epoch(self, current_epoch = epoch_num)
-                # do we need scaled_time?
-                scaled_time = self.num_agents * sum_time
-                scaled_play_time = self.num_agents * play_time
-                curr_frames = self.curr_frames * self.world_size if self.multi_gpu else self.curr_frames
-                self.frame += curr_frames
+                # Calculate approximate form of reverse KL Divergence for early stopping
+                # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
+                # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
+                # and Schulman blog: http://joschu.net/blog/kl-approx.html
+                with torch.no_grad():
+                    log_ratio = log_prob - rollout_data.old_log_prob
+                    approx_kl_div = torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                    approx_kl_divs.append(approx_kl_div)
 
-                print_statistics(self.print_stats, curr_frames, step_time, scaled_play_time, scaled_time, 
-                                epoch_num, self.max_epochs, frame, self.max_frames)
+                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                    continue_training = False
+                    if self.verbose >= 1:
+                        print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
+                    break
 
-                self.write_stats(total_time, epoch_num, step_time, play_time, update_time,
-                                a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame,
-                                scaled_time, scaled_play_time, curr_frames)
+                # Optimization step
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                # Clip grad norm
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
 
-                if len(b_losses) > 0:
-                    self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
+            self._n_updates += 1
+            if not continue_training:
+                break
 
-                if self.game_rewards.current_size > 0:
-                    mean_rewards = self.game_rewards.get_mean()
-                    mean_shaped_rewards = self.game_shaped_rewards.get_mean()
-                    mean_lengths = self.game_lengths.get_mean()
-                    self.mean_rewards = mean_rewards[0]
+        explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-                    for i in range(self.value_size):
-                        rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
-                        self.writer.add_scalar(rewards_name + '/step'.format(i), mean_rewards[i], frame)
-                        self.writer.add_scalar(rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
-                        self.writer.add_scalar(rewards_name + '/time'.format(i), mean_rewards[i], total_time)
-                        self.writer.add_scalar('shaped_' + rewards_name + '/step'.format(i), mean_shaped_rewards[i], frame)
-                        self.writer.add_scalar('shaped_' + rewards_name + '/iter'.format(i), mean_shaped_rewards[i], epoch_num)
-                        self.writer.add_scalar('shaped_' + rewards_name + '/time'.format(i), mean_shaped_rewards[i], total_time)
+        # Logs
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/explained_variance", explained_var)
+        if hasattr(self.policy, "log_std"):
+            self.logger.record("train/std", torch.exp(self.policy.log_std).mean().item())
 
-                    self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
-                    self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
-                    self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/clip_range", clip_range)
+        if self.clip_range_vf is not None:
+            self.logger.record("train/clip_range_vf", clip_range_vf)
 
-                    if self.has_self_play_config:
-                        self.self_play_manager.update(self)
+    def learn(
+        self: SelfPPO,
+        total_timesteps: int,
+        callback: MaybeCallback = None,
+        log_interval: int = 1,
+        tb_log_name: str = "PPO",
+        reset_num_timesteps: bool = True,
+        progress_bar: bool = False,
+    ) -> SelfPPO:
+    
+        iteration = 0
 
-                    checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
+        total_timesteps, callback = self._setup_learn(
+            total_timesteps,
+            callback,
+            reset_num_timesteps,
+            tb_log_name,
+            progress_bar,
+        )
+    
+        callback.on_training_start(locals(), globals())
 
-                    if self.save_freq > 0:
-                        if epoch_num % self.save_freq == 0:
-                            self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+        assert self.env is not None
 
-                    if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
-                        print('saving next best rewards: ', mean_rewards)
-                        self.last_mean_rewards = mean_rewards[0]
-                        self.save(os.path.join(self.nn_dir, self.config['name']))
+        while self.num_timesteps < total_timesteps:
+            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
 
-                        if 'score_to_win' in self.config:
-                            if self.last_mean_rewards > self.config['score_to_win']:
-                                print('Maximum reward achieved. Network won!')
-                                self.save(os.path.join(self.nn_dir, checkpoint_name))
-                                should_exit = True
+            if not continue_training:
+                break
 
-                if epoch_num >= self.max_epochs and self.max_epochs != -1:
-                    if self.game_rewards.current_size == 0:
-                        print('WARNING: Max epochs reached before any env terminated at least once')
-                        mean_rewards = -np.inf
+            iteration += 1
+            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
 
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_ep_' + str(epoch_num) \
-                        + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
-                    print('MAX EPOCHS NUM!')
-                    should_exit = True
+            # Display training infos
+            if log_interval is not None and iteration % log_interval == 0:
+                assert self.ep_info_buffer is not None
+                self._dump_logs(iteration)
 
-                if self.frame >= self.max_frames and self.max_frames != -1:
-                    if self.game_rewards.current_size == 0:
-                        print('WARNING: Max frames reached before any env terminated at least once')
-                        mean_rewards = -np.inf
+            self.train()
 
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_frame_' + str(self.frame) \
-                        + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
-                    print('MAX FRAMES NUM!')
-                    should_exit = True
+        callback.on_training_end()
 
-                update_time = 0
+        return self
+    
+    def _setup_model(self) -> None:
+        self._setup_lr_schedule()
+        self.set_random_seed(self.seed)
 
-            if self.multi_gpu:
-                should_exit_t = torch.tensor(should_exit, device=self.device).float()
-                dist.broadcast(should_exit_t, 0)
-                should_exit = should_exit_t.float().item()
-            if should_exit:
-                return self.last_mean_rewards, epoch_num
+        if self.rollout_buffer_class is None:
+            if isinstance(self.observation_space, spaces.Dict):
+                self.rollout_buffer_class = DictRolloutBuffer
+            else:
+                self.rollout_buffer_class = RolloutBuffer
 
-            if should_exit:
-                return self.last_mean_rewards, epoch_num
-            
-    def save(self, fn):
-        state = self.get_full_state_weights()
-        torch_ext.save_checkpoint(fn, state)
+        self.rollout_buffer = self.rollout_buffer_class(
+            self.n_steps,
+            self.observation_space,  # type: ignore[arg-type]
+            self.action_space,
+            device=self.device,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            n_envs=self.n_envs,
+            **self.rollout_buffer_kwargs,
+        )
+        self.policy = ActorCriticPolicy(  # type: ignore[assignment]
+            self.observation_space, self.action_space, self.lr_schedule, **self.policy_kwargs
+        )
+        self.policy = self.policy.to(self.device)
 
-    def restore(self, fn, set_epoch=True):
-        checkpoint = torch_ext.load_checkpoint(fn)
-        self.set_full_state_weights(checkpoint, set_epoch=set_epoch)
+        # Initialize schedules for policy/value clipping
+        self.clip_range = get_schedule_fn(self.clip_range)
+        if self.clip_range_vf is not None:
+            if isinstance(self.clip_range_vf, (float, int)):
+                assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
 
-    def restore_central_value_function(self, fn):
-        checkpoint = torch_ext.load_checkpoint(fn)
-        self.set_central_value_function_weights(checkpoint)
-
-    def get_masked_action_values(self, obs, action_masks):
-        assert False
-
-    def calc_gradients(self, input_dict):
-        """Compute gradients needed to step the networks of the algorithm.
-
-        Core algo logic is defined here
-
-        Args:
-            input_dict (:obj:`dict`): Algo inputs as a dict.
-
+            self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
+   
+    def collect_rollouts(
+        self,
+        env,
+        callback: BaseCallback,
+        rollout_buffer: RolloutBuffer,
+        n_rollout_steps: int,
+    ) -> bool:
         """
-        value_preds_batch = input_dict['old_values']
-        old_action_log_probs_batch = input_dict['old_logp_actions']
-        advantage = input_dict['advantages']
-        old_mu_batch = input_dict['mu']
-        old_sigma_batch = input_dict['sigma']
-        return_batch = input_dict['returns']
-        actions_batch = input_dict['actions']
-        obs_batch = input_dict['obs']
-        obs_batch = self._preproc_obs(obs_batch)
+        Collect experiences using the current policy and fill a ``RolloutBuffer``.
+        The term rollout here refers to the model-free notion and should not
+        be used with the concept of rollout used in model-based RL or planning.
 
-        lr_mul = 1.0
-        curr_e_clip = self.e_clip
+        :param env: The training environment
+        :param callback: Callback that will be called at each step
+            (and at the beginning and end of the rollout)
+        :param rollout_buffer: Buffer to fill with rollouts
+        :param n_rollout_steps: Number of experiences to collect per environment
+        :return: True if function returned with at least `n_rollout_steps`
+            collected, False if callback terminated rollout prematurely.
+        """
+        assert self._last_obs is not None, "No previous observation was provided"
+        # Switch to eval mode (this affects batch norm / dropout)
+        # self.policy.set_training_mode(False)
+        self.policy.train(False)
 
-        batch_dict = {
-            'is_train': True,
-            'prev_actions': actions_batch, 
-            'obs' : obs_batch,
-        }
+        n_steps = 0
+        rollout_buffer.reset()
 
-        rnn_masks = None
-        if self.is_rnn:
-            rnn_masks = input_dict['rnn_masks']
-            batch_dict['rnn_states'] = input_dict['rnn_states']
-            batch_dict['seq_length'] = self.seq_length
+        callback.on_rollout_start()
 
-            if self.zero_rnn_on_done:
-                batch_dict['dones'] = input_dict['dones']            
+        while n_steps < n_rollout_steps:
+            forward_start = time.time()
+            with torch.no_grad():
+                # Convert to pytorch tensor or to TensorDict
+                obs_tensor = obs_as_tensor(self._last_obs, self.device)
+                actions, values, log_probs = self.policy(obs_tensor)
+            forward_end = time.time()
+            # actions = actions.cpu().numpy()
 
-        with torch.cuda.amp.autocast(enabled=self.mixed_precision):
-            res_dict = self.model(batch_dict)
-            action_log_probs = res_dict['prev_neglogp']
-            values = res_dict['values']
-            entropy = res_dict['entropy']
-            mu = res_dict['mus']
-            sigma = res_dict['sigmas']
+            # Rescale and perform action
+            clipped_actions = actions
+            clipped_actions = torch.clip(actions, torch.tensor(self.action_space.low, device=self.device), torch.tensor(self.action_space.high, device=self.device))
 
-            a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
+            step_start = time.time()
+            new_obs, rewards, dones, infos = env.step(clipped_actions)
+            step_end = time.time()
 
-            if self.has_value_loss:
-                c_loss = common_losses.critic_loss(self.model,value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
-            else:
-                c_loss = torch.zeros(1, device=self.ppo_device)
-            if self.bound_loss_type == 'regularisation':
-                b_loss = self.reg_loss(mu)
-            elif self.bound_loss_type == 'bound':
-                b_loss = self.bound_loss(mu)
-            else:
-                b_loss = torch.zeros(1, device=self.ppo_device)
-            losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
-            a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
+            other_start = time.time()
 
-            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
-            aux_loss = self.model.get_aux_loss()
-            self.aux_loss_dict = {}
-            if aux_loss is not None:
-                for k, v in aux_loss.items():
-                    loss += v
-                    if k in self.aux_loss_dict:
-                        self.aux_loss_dict[k] = v.detach()
-                    else:
-                        self.aux_loss_dict[k] = [v.detach()]
-            if self.multi_gpu:
-                self.optimizer.zero_grad()
-            else:
-                for param in self.model.parameters():
-                    param.grad = None
+            self.num_timesteps += env.n_envs
 
-        self.scaler.scale(loss).backward()
-        #TODO: Refactor this ugliest code of they year
-        self.trancate_gradients_and_step()
+            # Give access to local variables
+            callback.update_locals(locals())
+            if not callback.on_step():
+                return False
+
+            self._update_info_buffer(infos, dones)
+            n_steps += 1
+
+            if isinstance(self.action_space, spaces.Discrete):
+                # Reshape in case of discrete action
+                actions = actions.reshape(-1, 1)
+
+            # Handle timeout by bootstrapping with value function
+            # see GitHub issue #633
+            for idx, done in enumerate(dones):
+                if (
+                    done
+                    and infos[idx].get("terminal_observation") is not None
+                    and infos[idx].get("TimeLimit.truncated", False)
+                ):
+                    terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
+                    with torch.no_grad():
+                        terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
+                    rewards[idx] += self.gamma * terminal_value
+
+            last_obs_cpu = {key: value.cpu().numpy() for key, value in self._last_obs.items()}
+
+            rollout_buffer.add(
+                # self._last_obs,  # type: ignore[arg-type]
+                last_obs_cpu,
+                actions.cpu(),
+                rewards.cpu(),
+                self._last_episode_starts,  # type: ignore[arg-type]
+                values.cpu(),
+                log_probs.cpu(),    
+            )
+            self._last_obs = new_obs  # type: ignore[assignment]
+            self._last_episode_starts = dones
+
+            other_end = time.time()
+            print(f"Step time: {step_end - step_start:.4f}s, Forward time: {forward_end - forward_start:.4f}s, Other time: {other_end - other_start:.4f}s")
 
         with torch.no_grad():
-            reduce_kl = rnn_masks is None
-            kl_dist = torch_ext.policy_kl(mu.detach(), sigma.detach(), old_mu_batch, old_sigma_batch, reduce_kl)
-            if rnn_masks is not None:
-                kl_dist = (kl_dist * rnn_masks).sum() / rnn_masks.numel()  #/ sum_mask
+            # Compute value for the last timestep
+            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
 
-        self.diagnostics.mini_batch(self,
-        {
-            'values' : value_preds_batch,
-            'returns' : return_batch,
-            'new_neglogp' : action_log_probs,
-            'old_neglogp' : old_action_log_probs_batch,
-            'masks' : rnn_masks
-        }, curr_e_clip, 0)      
+        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
-        self.train_result = (a_loss, c_loss, entropy, \
-            kl_dist, self.last_lr, lr_mul, \
-            mu.detach(), sigma.detach(), b_loss)
+        callback.update_locals(locals())
+        callback.on_rollout_end()
 
-    def train_actor_critic(self, input_dict):
-        self.calc_gradients(input_dict)
-        return self.train_result
-
-    def reg_loss(self, mu):
-        if self.bounds_loss_coef is not None:
-            reg_loss = (mu*mu).sum(axis=-1)
-        else:
-            reg_loss = 0
-        return reg_loss
-
-    def bound_loss(self, mu):
-        if self.bounds_loss_coef is not None:
-            soft_bound = 1.1
-            mu_loss_high = torch.clamp_min(mu - soft_bound, 0.0)**2
-            mu_loss_low = torch.clamp_max(mu + soft_bound, 0.0)**2
-            b_loss = (mu_loss_low + mu_loss_high).sum(axis=-1)
-        else:
-            b_loss = 0
-        return b_loss
+        return True
     
-    def get_central_value(self, obs_dict):
-        return self.central_value_net.get_value(obs_dict)
+    def _init_callback(
+        self,
+        callback: MaybeCallback,
+        progress_bar: bool = False,
+    ) -> BaseCallback:
+        """
+        :param callback: Callback(s) called at every step with state of the algorithm.
+        :param progress_bar: Display a progress bar using tqdm and rich.
+        :return: A hybrid callback calling `callback` and performing evaluation.
+        """
+        # Convert a list of callbacks into a callback
+        if isinstance(callback, list):
+            callback = CallbackList(callback)
 
-    def train_central_value(self):
-        return self.central_value_net.train_net()
+        # Convert functional callback to object
+        if not isinstance(callback, BaseCallback):
+            callback = ConvertCallback(callback)
 
-    def get_full_state_weights(self):
-        state = self.get_weights()
-        state['epoch'] = self.epoch_num
-        state['frame'] = self.frame
-        state['optimizer'] = self.optimizer.state_dict()
+        # Add progress bar callback
+        if progress_bar:
+            callback = CallbackList([callback, ProgressBarCallback()])
 
-        if self.has_central_value:
-            state['assymetric_vf_nets'] = self.central_value_net.state_dict()
+        callback.init_callback(self)
+        return callback
 
-        # This is actually the best reward ever achieved. last_mean_rewards is perhaps not the best variable name
-        # We save it to the checkpoint to prevent overriding the "best ever" checkpoint upon experiment restart
-        state['last_mean_rewards'] = self.last_mean_rewards
+    def _setup_learn(
+        self,
+        total_timesteps: int,
+        callback: MaybeCallback,
+        reset_num_timesteps: bool = True,
+        tb_log_name: str = "run",
+        progress_bar: bool = False,
+    ):
+        """
+        Initialize different variables needed for training.
 
-        if self.vec_env is not None:
-            env_state = self.vec_env.get_env_state()
-            state['env_state'] = env_state
+        :param total_timesteps: The total number of samples (env steps) to train on
+        :param reset_num_timesteps: Whether to reset or not the ``num_timesteps`` attribute
+        :param tb_log_name: the name of the run for tensorboard log
+        :param progress_bar: Display a progress bar using tqdm and rich.
+        :return: Total timesteps
+        """
+        self.start_time = time.time_ns()
 
-        return state
+        if self.ep_info_buffer is None or reset_num_timesteps:
+            # Initialize buffers if they don't exist, or reinitialize if resetting counters
+            self.ep_info_buffer = deque(maxlen=self._stats_window_size)
+            self.ep_success_buffer = deque(maxlen=self._stats_window_size)
 
-    def set_full_state_weights(self, weights, set_epoch=True):
+        if self.action_noise is not None:
+            self.action_noise.reset()
 
-        self.set_weights(weights)
-        if set_epoch:
-            self.epoch_num = weights['epoch']
-            self.frame = weights['frame']
-
-        if self.has_central_value:
-            self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
-
-        self.optimizer.load_state_dict(weights['optimizer'])
-
-        self.last_mean_rewards = weights.get('last_mean_rewards', -1000000000)
-
-        if self.vec_env is not None:
-            env_state = weights.get('env_state', None)
-            self.vec_env.set_env_state(env_state)
-
-    def get_weights(self):
-        state = self.get_stats_weights()
-        state['model'] = self.model.state_dict()
-        return state
-
-    def get_stats_weights(self, model_stats=False):
-        state = {}
-        if self.mixed_precision:
-            state['scaler'] = self.scaler.state_dict()
-        if self.has_central_value:
-            state['central_val_stats'] = self.central_value_net.get_stats_weights(model_stats)
-        if model_stats:
-            if self.normalize_input:
-                state['running_mean_std'] = self.model.running_mean_std.state_dict()
-            if self.normalize_value:
-                state['reward_mean_std'] = self.model.value_mean_std.state_dict()
-
-        return state
-
-    def set_stats_weights(self, weights):
-        if self.normalize_rms_advantage:
-            self.advantage_mean_std.load_state_dic(weights['advantage_mean_std'])
-        if self.normalize_input and 'running_mean_std' in weights:
-            self.model.running_mean_std.load_state_dict(weights['running_mean_std'])
-        if self.normalize_value and 'normalize_value' in weights:
-            self.model.value_mean_std.load_state_dict(weights['reward_mean_std'])
-        if self.mixed_precision and 'scaler' in weights:
-            self.scaler.load_state_dict(weights['scaler'])
-
-    def set_weights(self, weights):
-        self.model.load_state_dict(weights['model'])
-        self.set_stats_weights(weights)
-
-    def get_param(self, param_name):
-        if param_name in [
-            "grad_norm",
-            "critic_coef", 
-            "bounds_loss_coef",
-            "entropy_coef",
-            "kl_threshold",
-            "gamma",
-            "tau",
-            "mini_epochs_num",
-            "e_clip",
-            ]:
-            return getattr(self, param_name)
-        elif param_name == "learning_rate":
-            return self.last_lr
+        if reset_num_timesteps:
+            self.num_timesteps = 0
+            self._episode_num = 0
         else:
-            raise NotImplementedError(f"Can't get param {param_name}")       
+            # Make sure training timesteps are ahead of the internal counter
+            total_timesteps += self.num_timesteps
+        self._total_timesteps = total_timesteps
+        self._num_timesteps_at_start = self.num_timesteps
 
-    def set_param(self, param_name, param_value):
-        if param_name in [
-            "grad_norm",
-            "critic_coef", 
-            "bounds_loss_coef",
-            "entropy_coef",
-            "gamma",
-            "tau",
-            "mini_epochs_num",
-            "e_clip",
-            ]:
-            setattr(self, param_name, param_value)
-        elif param_name == "learning_rate":
-            if self.global_rank == 0:
-                if self.is_adaptive_lr:
-                    raise NotImplementedError("Can't directly mutate LR on this schedule")
-                else:
-                    self.learning_rate = param_value
+        # Avoid resetting the environment when calling ``.learn()`` consecutive times
+        if reset_num_timesteps or self._last_obs is None:
+            assert self.env is not None
+            self._last_obs = self.env.reset()  # type: ignore[assignment]
+            self._last_episode_starts = np.ones((self.env.n_envs,), dtype=bool)
+            # Retrieve unnormalized observation for saving into the buffer
+            if self._vec_normalize_env is not None:
+                self._last_original_obs = self._vec_normalize_env.get_original_obs()
 
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
-        elif param_name == "kl_threshold":
-            if self.global_rank == 0:
-                if self.is_adaptive_lr:
-                    self.kl_threshold = param_value
-                    self.scheduler.kl_threshold = param_value
-                else:
-                    raise NotImplementedError("Can't directly mutate kl threshold")
-        else:
-            raise NotImplementedError(f"No param found for {param_value}")
+        # Configure logger's outputs if no logger was passed
+        if not self._custom_logger:
+            # self._logger = configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
+            self.logger = configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
+
+        # Create eval callback if needed
+        callback = self._init_callback(callback, progress_bar)
+
+        return total_timesteps, callback
     
-    def _preproc_obs(self, obs_batch):
-        if type(obs_batch) is dict:
-            obs_batch = copy.copy(obs_batch)
-            for k,v in obs_batch.items():
-                if v.dtype == torch.uint8:
-                    obs_batch[k] = v.float() / 255.0
-                else:
-                    obs_batch[k] = v
+    def _update_learning_rate(self, optimizers: Union[list[torch.optim.Optimizer], torch.optim.Optimizer]) -> None:
+        """
+        Update the optimizers learning rate using the current learning rate schedule
+        and the current progress remaining (from 1 to 0).
+
+        :param optimizers:
+            An optimizer or a list of optimizers.
+        """
+        # Log the current learning rate
+        self.logger.record("train/learning_rate", self.lr_schedule(self._current_progress_remaining))
+
+        if not isinstance(optimizers, list):
+            optimizers = [optimizers]
+        for optimizer in optimizers:
+            update_learning_rate(optimizer, self.lr_schedule(self._current_progress_remaining))
+
+    def _setup_lr_schedule(self) -> None:
+        """Transform to callable if needed."""
+        self.lr_schedule = get_schedule_fn(self.learning_rate)
+    
+    def _update_current_progress_remaining(self, num_timesteps: int, total_timesteps: int) -> None:
+        """
+        Compute current progress remaining (starts from 1 and ends to 0)
+
+        :param num_timesteps: current number of timesteps
+        :param total_timesteps:
+        """
+        self._current_progress_remaining = 1.0 - float(num_timesteps) / float(total_timesteps)
+
+    def set_random_seed(self, seed: Optional[int] = None) -> None:
+        """
+        Set the seed of the pseudo-random generators
+        (python, numpy, pytorch, gym, action_space)
+
+        :param seed:
+        """
+        if seed is None:
+            return
+        set_random_seed(seed, using_cuda=self.device.type == torch.device("cuda").type)
+        self.action_space.seed(seed)
+        # self.env is always a VecEnv
+        if self.env is not None:
+            self.env.seed(seed)
+
+    def _update_info_buffer(self, infos: list[dict[str, Any]], dones: Optional[np.ndarray] = None) -> None:
+        """
+        Retrieve reward, episode length, episode success and update the buffer
+        if using Monitor wrapper or a GoalEnv.
+
+        :param infos: List of additional information about the transition.
+        :param dones: Termination signals
+        """
+        assert self.ep_info_buffer is not None
+        assert self.ep_success_buffer is not None
+
+        if dones is None:
+            dones = np.array([False] * len(infos))
+        for idx, info in enumerate(infos):
+            maybe_ep_info = info.get("episode")
+            maybe_is_success = info.get("is_success")
+            if maybe_ep_info is not None:
+                self.ep_info_buffer.extend([maybe_ep_info])
+            if maybe_is_success is not None and dones[idx]:
+                self.ep_success_buffer.append(maybe_is_success)
+
+    def _dump_logs(self, iteration: int) -> None:
+        """
+        Write log.
+
+        :param iteration: Current logging iteration
+        """
+        assert self.ep_info_buffer is not None
+        assert self.ep_success_buffer is not None
+
+        time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
+        fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+        self.logger.record("time/iterations", iteration, exclude="tensorboard")
+        if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
+            self.logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
+            self.logger.record("rollout/ep_goal_rew", safe_mean([ep_info["g"] for ep_info in self.ep_info_buffer]))
+            self.logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+            self.logger.record("rollout/ep_rew_mean_per_step", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]) / safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+            self.logger.record("rollout/ep_goal_rew_per_step", safe_mean([ep_info["g"] for ep_info in self.ep_info_buffer]) / safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+            self.logger.record("rollout/success_rate", safe_mean([ep_info["s"] for ep_info in self.ep_info_buffer]))
         else:
-            if obs_batch.dtype == torch.uint8:
-                obs_batch = obs_batch.float() / 255.0
-        return obs_batch
+            print(self.ep_info_buffer)
+            # raise ValueError("Error: the environment should not return an empty info buffer")
+        self.logger.record("time/fps", fps)
+        self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
+        self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
+        if len(self.ep_success_buffer) > 0:
+            self.logger.record("rollout/success_rate", safe_mean(self.ep_success_buffer))
+        self.logger.dump(step=self.num_timesteps)
 
-    def play_steps(self):
-        update_list = self.update_list
+    def _excluded_save_params(self) -> list[str]:
+        """
+        Returns the names of the parameters that should be excluded from being
+        saved by pickling. E.g. replay buffers are skipped by default
+        as they take up a lot of space. PyTorch variables should be excluded
+        with this so they can be stored with ``th.save``.
 
-        step_time = 0.0
+        :return: List of parameters that should be excluded from being saved with pickle.
+        """
+        return [
+            "policy",
+            "device",
+            "env",
+            "replay_buffer",
+            "rollout_buffer",
+            "_vec_normalize_env",
+            "_episode_storage",
+            "_logger",
+            "_custom_logger",
+        ]
+    
+    def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
+        """
+        Get the name of the torch variables that will be saved with
+        PyTorch ``th.save``, ``th.load`` and ``state_dicts`` instead of the default
+        pickling strategy. This is to handle device placement correctly.
 
-        for n in range(self.horizon_length):
-            if self.use_action_masks:
-                masks = self.vec_env.get_action_masks()
-                res_dict = self.get_masked_action_values(self.obs, masks)
+        Names can point to specific variables under classes, e.g.
+        "policy.optimizer" would point to ``optimizer`` object of ``self.policy``
+        if this object.
+
+        :return:
+            List of Torch variables whose state dicts to save (e.g. th.nn.Modules),
+            and list of other Torch variables to store with ``th.save``.
+        """
+        state_dicts = ["policy"]
+
+        return state_dicts, []
+    
+    def set_parameters(
+        self,
+        load_path_or_dict,
+        exact_match: bool = True,
+        device = "cuda",
+    ) -> None:
+        """
+        Load parameters from a given zip-file or a nested dictionary containing parameters for
+        different modules (see ``get_parameters``).
+
+        :param load_path_or_iter: Location of the saved data (path or file-like, see ``save``), or a nested
+            dictionary containing nn.Module parameters used by the policy. The dictionary maps
+            object names to a state-dictionary returned by ``torch.nn.Module.state_dict()``.
+        :param exact_match: If True, the given parameters should include parameters for each
+            module and each of their parameters, otherwise raises an Exception. If set to False, this
+            can be used to update only specific parameters.
+        :param device: Device on which the code should run.
+        """
+        params = {}
+        if isinstance(load_path_or_dict, dict):
+            params = load_path_or_dict
+        else:
+            _, params, _ = load_from_zip_file(load_path_or_dict, device=device, load_data=False)
+
+        # Keep track which objects were updated.
+        # `_get_torch_save_params` returns [params, other_pytorch_variables].
+        # We are only interested in former here.
+        objects_needing_update = set(self._get_torch_save_params()[0])
+        updated_objects = set()
+
+        for name in params:
+            attr = None
+            try:
+                attr = recursive_getattr(self, name)
+            except Exception as e:
+                # What errors recursive_getattr could throw? KeyError, but
+                # possible something else too (e.g. if key is an int?).
+                # Catch anything for now.
+                raise ValueError(f"Key {name} is an invalid object name.") from e
+
+            if isinstance(attr, torch.optim.Optimizer):
+                # Optimizers do not support "strict" keyword...
+                # Seems like they will just replace the whole
+                # optimizer state with the given one.
+                # On top of this, optimizer state-dict
+                # seems to change (e.g. first ``optim.step()``),
+                # which makes comparing state dictionary keys
+                # invalid (there is also a nesting of dictionaries
+                # with lists with dictionaries with ...), adding to the
+                # mess.
+                #
+                # TL;DR: We might not be able to reliably say
+                # if given state-dict is missing keys.
+                #
+                # Solution: Just load the state-dict as is, and trust
+                # the user has provided a sensible state dictionary.
+                attr.load_state_dict(params[name])  # type: ignore[arg-type]
             else:
-                res_dict = self.get_action_values(self.obs)
-            self.experience_buffer.update_data('obses', n, self.obs['obs'])
-            self.experience_buffer.update_data('dones', n, self.dones)
+                # Assume attr is th.nn.Module
+                attr.load_state_dict(params[name], strict=exact_match)
+            updated_objects.add(name)
 
-            for k in update_list:
-                self.experience_buffer.update_data(k, n, res_dict[k]) 
-            if self.has_central_value:
-                self.experience_buffer.update_data('states', n, self.obs['states'])
+        if exact_match and updated_objects != objects_needing_update:
+            raise ValueError(
+                "Names of parameters do not match agents' parameters: "
+                f"expected {objects_needing_update}, got {updated_objects}"
+            )
+    
+    def load(  # noqa: C901
+        cls,
+        path,
+        env = None,
+        device = "cuda",
+        custom_objects = None,
+        print_system_info = False,
+        force_reset = True,
+        **kwargs,
+    ):
+        """
+        Load the model from a zip-file.
+        Warning: ``load`` re-creates the model from scratch, it does not update it in-place!
+        For an in-place load use ``set_parameters`` instead.
 
-            step_time_start = time.time()
-            self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
-            step_time_end = time.time()
+        :param path: path to the file (or a file-like) where to
+            load the agent from
+        :param env: the new environment to run the loaded model on
+            (can be None if you only need prediction from a trained model) has priority over any saved environment
+        :param device: Device on which the code should run.
+        :param custom_objects: Dictionary of objects to replace
+            upon loading. If a variable is present in this dictionary as a
+            key, it will not be deserialized and the corresponding item
+            will be used instead. Similar to custom_objects in
+            ``keras.models.load_model``. Useful when you have an object in
+            file that can not be deserialized.
+        :param print_system_info: Whether to print system info from the saved model
+            and the current system info (useful to debug loading issues)
+        :param force_reset: Force call to ``reset()`` before training
+            to avoid unexpected behavior.
+            See https://github.com/DLR-RM/stable-baselines3/issues/597
+        :param kwargs: extra arguments to change the model when loading
+        :return: new model instance with loaded parameters
+        """
+        if print_system_info:
+            print("== CURRENT SYSTEM INFO ==")
+            get_system_info()
 
-            step_time += (step_time_end - step_time_start)
+        data, params, pytorch_variables = load_from_zip_file(
+            path,
+            device=device,
+            custom_objects=custom_objects,
+            print_system_info=print_system_info,
+        )
 
-            shaped_rewards = self.rewards_shaper(rewards)
-            if self.value_bootstrap and 'time_outs' in infos:
-                shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
+        assert data is not None, "No data found in the saved file"
+        assert params is not None, "No params found in the saved file"
 
-            self.experience_buffer.update_data('rewards', n, shaped_rewards)
+        # Remove stored device information and replace with ours
+        if "policy_kwargs" in data:
+            if "device" in data["policy_kwargs"]:
+                del data["policy_kwargs"]["device"]
+            # backward compatibility, convert to new format
+            saved_net_arch = data["policy_kwargs"].get("net_arch")
+            if saved_net_arch and isinstance(saved_net_arch, list) and isinstance(saved_net_arch[0], dict):
+                data["policy_kwargs"]["net_arch"] = saved_net_arch[0]
 
-            self.current_rewards += rewards
-            self.current_shaped_rewards += shaped_rewards
-            self.current_lengths += 1
-            all_done_indices = self.dones.nonzero(as_tuple=False)
-            env_done_indices = all_done_indices[::self.num_agents]
-     
-            self.game_rewards.update(self.current_rewards[env_done_indices])
-            self.game_shaped_rewards.update(self.current_shaped_rewards[env_done_indices])
-            self.game_lengths.update(self.current_lengths[env_done_indices])
-            self.algo_observer.process_infos(infos, env_done_indices)
+        if "policy_kwargs" in kwargs and kwargs["policy_kwargs"] != data["policy_kwargs"]:
+            raise ValueError(
+                f"The specified policy kwargs do not equal the stored policy kwargs."
+                f"Stored kwargs: {data['policy_kwargs']}, specified kwargs: {kwargs['policy_kwargs']}"
+            )
 
-            not_dones = 1.0 - self.dones.float()
+        if "observation_space" not in data or "action_space" not in data:
+            raise KeyError("The observation_space and action_space were not given, can't verify new environments")
 
-            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
-            self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
-            self.current_lengths = self.current_lengths * not_dones
+        # Gym -> Gymnasium space conversion
+        for key in {"observation_space", "action_space"}:
+            data[key] = _convert_space(data[key])
 
-        last_values = self.get_values(self.obs)
+        model = cls(
+            policy=data["policy_class"],
+            env=env,
+            device=device,
+            _init_setup_model=False,  # type: ignore[call-arg]
+        )
 
-        fdones = self.dones.float()
-        mb_fdones = self.experience_buffer.tensor_dict['dones'].float()
-        mb_values = self.experience_buffer.tensor_dict['values']
-        mb_rewards = self.experience_buffer.tensor_dict['rewards']
-        mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
-        mb_returns = mb_advs + mb_values
+        # load parameters
+        model.__dict__.update(data)
+        model.__dict__.update(kwargs)
+        model._setup_model()
 
-        batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
-        batch_dict['returns'] = swap_and_flatten01(mb_returns)
-        batch_dict['played_frames'] = self.batch_size
-        batch_dict['step_time'] = step_time
-
-        return batch_dict
-
-    def play_steps_rnn(self):
-        update_list = self.update_list
-        mb_rnn_states = self.mb_rnn_states
-        step_time = 0.0
-
-        for n in range(self.horizon_length):
-            if n % self.seq_length == 0:
-                for s, mb_s in zip(self.rnn_states, mb_rnn_states):
-                    mb_s[n // self.seq_length,:,:,:] = s
-
-            if self.has_central_value:
-                self.central_value_net.pre_step_rnn(n)
-
-            if self.use_action_masks:
-                masks = self.vec_env.get_action_masks()
-                res_dict = self.get_masked_action_values(self.obs, masks)
+        try:
+            # put state_dicts back in place
+            model.set_parameters(params, exact_match=True, device=device)
+        except RuntimeError as e:
+            # Patch to load policies saved using SB3 < 1.7.0
+            # the error is probably due to old policy being loaded
+            # See https://github.com/DLR-RM/stable-baselines3/issues/1233
+            if "pi_features_extractor" in str(e) and "Missing key(s) in state_dict" in str(e):
+                model.set_parameters(params, exact_match=False, device=device)
+                warnings.warn(
+                    "You are probably loading a A2C/PPO model saved with SB3 < 1.7.0, "
+                    "we deactivated exact_match so you can save the model "
+                    "again to avoid issues in the future "
+                    "(see https://github.com/DLR-RM/stable-baselines3/issues/1233 for more info). "
+                    f"Original error: {e} \n"
+                    "Note: the model should still work fine, this only a warning."
+                )
             else:
-                res_dict = self.get_action_values(self.obs)
+                raise e
+        except ValueError as e:
+            # Patch to load DQN policies saved using SB3 < 2.4.0
+            # The target network params are no longer in the optimizer
+            # See https://github.com/DLR-RM/stable-baselines3/pull/1963
+            saved_optim_params = params["policy.optimizer"]["param_groups"][0]["params"]  # type: ignore[index]
+            n_params_saved = len(saved_optim_params)
+            n_params = len(model.policy.optimizer.param_groups[0]["params"])
+            if n_params_saved == 2 * n_params:
+                # Truncate to include only online network params
+                params["policy.optimizer"]["param_groups"][0]["params"] = saved_optim_params[:n_params]  # type: ignore[index]
 
-            self.rnn_states = res_dict['rnn_states']
-            self.experience_buffer.update_data('obses', n, self.obs['obs'])
-            self.experience_buffer.update_data('dones', n, self.dones.byte())
+                model.set_parameters(params, exact_match=True, device=device)
+                warnings.warn(
+                    "You are probably loading a DQN model saved with SB3 < 2.4.0, "
+                    "we truncated the optimizer state so you can save the model "
+                    "again to avoid issues in the future "
+                    "(see https://github.com/DLR-RM/stable-baselines3/pull/1963 for more info). "
+                    f"Original error: {e} \n"
+                    "Note: the model should still work fine, this only a warning."
+                )
+            else:
+                raise e
 
-            for k in update_list:
-                self.experience_buffer.update_data(k, n, res_dict[k])
-            if self.has_central_value:
-                self.experience_buffer.update_data('states', n, self.obs['states'])
+        # put other pytorch variables back in place
+        if pytorch_variables is not None:
+            for name in pytorch_variables:
+                # Skip if PyTorch variable was not defined (to ensure backward compatibility).
+                # This happens when using SAC/TQC.
+                # SAC has an entropy coefficient which can be fixed or optimized.
+                # If it is optimized, an additional PyTorch variable `log_ent_coef` is defined,
+                # otherwise it is initialized to `None`.
+                if pytorch_variables[name] is None:
+                    continue
+                # Set the data attribute directly to avoid issue when using optimizers
+                # See https://github.com/DLR-RM/stable-baselines3/issues/391
+                recursive_setattr(model, f"{name}.data", pytorch_variables[name].data)
 
-            step_time_start = time.time()
-            self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
-            step_time_end = time.time()
+        # Sample gSDE exploration matrix, so it uses the right device
+        # see issue #44
+        return model
+    
+    def get_parameters(self) -> dict[str, dict]:
+        """
+        Return the parameters of the agent. This includes parameters from different networks, e.g.
+        critics (value functions) and policies (pi functions).
 
-            step_time += (step_time_end - step_time_start)
-
-            shaped_rewards = self.rewards_shaper(rewards)
-
-            if self.value_bootstrap and 'time_outs' in infos:
-                shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
-
-            self.experience_buffer.update_data('rewards', n, shaped_rewards)
-
-            self.current_rewards += rewards
-            self.current_shaped_rewards += shaped_rewards
-            self.current_lengths += 1
-            all_done_indices = self.dones.nonzero(as_tuple=False)
-            env_done_indices = all_done_indices[::self.num_agents]
-
-            if len(all_done_indices) > 0:
-                if self.zero_rnn_on_done:
-                    for s in self.rnn_states:
-                        s[:, all_done_indices, :] = s[:, all_done_indices, :] * 0.0
-                if self.has_central_value:
-                    self.central_value_net.post_step_rnn(all_done_indices)
-
-            self.game_rewards.update(self.current_rewards[env_done_indices])
-            self.game_shaped_rewards.update(self.current_shaped_rewards[env_done_indices])
-            self.game_lengths.update(self.current_lengths[env_done_indices])
-            self.algo_observer.process_infos(infos, env_done_indices)
-
-            not_dones = 1.0 - self.dones.float()
-
-            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
-            self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
-            self.current_lengths = self.current_lengths * not_dones
-
-        last_values = self.get_values(self.obs)
-
-        fdones = self.dones.float()
-        mb_fdones = self.experience_buffer.tensor_dict['dones'].float()
-
-        mb_values = self.experience_buffer.tensor_dict['values']
-        mb_rewards = self.experience_buffer.tensor_dict['rewards']
-        mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
-        mb_returns = mb_advs + mb_values
-        batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
-
-        batch_dict['returns'] = swap_and_flatten01(mb_returns)
-        batch_dict['played_frames'] = self.batch_size
-        states = []
-        for mb_s in mb_rnn_states:
-            t_size = mb_s.size()[0] * mb_s.size()[2]
-            h_size = mb_s.size()[3]
-            states.append(mb_s.permute(1,2,0,3).reshape(-1,t_size, h_size))
-
-        batch_dict['rnn_states'] = states
-        batch_dict['step_time'] = step_time
-
-        return batch_dict
+        :return: Mapping of from names of the objects to PyTorch state-dicts.
+        """
+        state_dicts_names, _ = self._get_torch_save_params()
+        params = {}
+        for name in state_dicts_names:
+            attr = recursive_getattr(self, name)
+            # Retrieve state dict
+            params[name] = attr.state_dict()
+        return params
 
 
+    def save(
+        self,
+        path,
+        exclude = ['_last_obs','_last_episode_starts','_last_original_obs','env','_vec_normalize_env','rollout_buffer','ep_info_buffer','logger','_custom_logger'],
+        include = ['device'],
+    ) -> None:
+        """
+        Save all the attributes of the object and the model parameters in a zip-file.
+
+        :param path: path to the file where the rl agent should be saved
+        :param exclude: name of parameters that should be excluded in addition to the default ones
+        :param include: name of parameters that might be excluded but should be included anyway
+        """
+        # Copy parameter list so we don't mutate the original dict
+        data = self.__dict__.copy()
+
+        # Exclude is union of specified parameters (if any) and standard exclusions
+        if exclude is None:
+            exclude = []
+        exclude = set(exclude).union(self._excluded_save_params())
+
+        # Do not exclude params if they are specifically included
+        if include is not None:
+            exclude = exclude.difference(include)
+
+        state_dicts_names, torch_variable_names = self._get_torch_save_params()
+        all_pytorch_variables = state_dicts_names + torch_variable_names
+        for torch_var in all_pytorch_variables:
+            # We need to get only the name of the top most module as we'll remove that
+            var_name = torch_var.split(".")[0]
+            # Any params that are in the save vars must not be saved by data
+            exclude.add(var_name)
+
+        # Remove parameter entries of parameters which are to be excluded
+        for param_name in exclude:
+            data.pop(param_name, None)
+
+        # Build dict of torch variables
+        pytorch_variables = None
+        if torch_variable_names is not None:
+            pytorch_variables = {}
+            for name in torch_variable_names:
+                attr = recursive_getattr(self, name)
+                pytorch_variables[name] = attr
+
+        # Build dict of state_dicts
+        params_to_save = self.get_parameters()
+
+        save_to_zip_file(path, data=data, params=params_to_save, pytorch_variables=pytorch_variables)
         
 
