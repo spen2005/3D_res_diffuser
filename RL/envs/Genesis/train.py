@@ -99,7 +99,7 @@ class MyEnv(VecEnv):
         n_envs = 1024, 
         show_viewer = False, 
         cam_pos = (0, 0, 2), 
-        cam_lookat = (0.0, 0.0, 0.0), 
+        cam_lookat = (0.0, 1.0, 0.0), 
         cam_fov = 40, 
         res = (64, 64),
         dt = 0.01,
@@ -146,7 +146,16 @@ class MyEnv(VecEnv):
         self._reset_env(done_envs_idx)
 
         # Extra step to get the transitions
-        self.scene.step()
+        qpos = self.robot.inverse_kinematics(
+            pos = np.random.uniform(0.5, 1, (self.n_envs, 3)),
+            quat = np.tile([1, 0, 0, 0], (self.n_envs, 1)),
+            max_samples = 20,
+            init_qpos = self.robot.get_dofs_position().contiguous(),
+            link = self.robot.get_link("panda_link7"),
+        )
+        self.robot.control_dofs_position(qpos)
+        for _ in range(100):
+            self.scene.step()
 
         states = self._get_obs() 
         print("Time taken for one step: ", (time.time() - self.prev_time) / self.n_envs)
@@ -167,7 +176,7 @@ class MyEnv(VecEnv):
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file="/mnt/home/spen2005/Desktop/3D_res_diffuser/RL/assets/panda_bullet/panda.urdf",
-                pos = (0.5, -0.4, 0),
+                pos = (0, -0.4, 0),
                 fixed=True,
                 merge_fixed_links=True
             )
