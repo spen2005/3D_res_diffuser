@@ -1,0 +1,26 @@
+{
+  "model_config": {
+    "vlm_path": "microsoft/Florence-2-large",
+    "freeze_florence": false,
+    "freeze_vision_tower": false,
+    "vlm_prompt_style": "default",
+    "token_dropout": 0.1,
+    "multistep": 10,
+    "num_sampling_steps": 4,
+    "lowdim_obs_dim": 7,
+    "action_dim": 7,
+    "act_window_size": 10,
+    "use_second_view": true,
+    "second_view_key": "image_wrist",
+    "action_type_adaln": true,
+    "use_causal_attention": true,
+    "use_cross_attn": true,
+    "sampling_type": "uniform",
+    "dit_dim": 1024,
+    "n_heads": 16,
+    "n_layers": 18,
+    "use_rope": true,
+    "query_seq_len": 120,
+    "rope_theta": 32.0
+  }
+}
