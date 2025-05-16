@@ -215,7 +215,7 @@ class MyEnv(VecEnv):
         import time
         start = time.time()
         images = self.cam.render()[0]
-
+        images = np.float32(images)
         images = torch.tensor(images, device=gs.device)
 
         proprioception = []

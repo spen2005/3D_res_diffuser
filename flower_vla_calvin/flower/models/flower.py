@@ -152,6 +152,7 @@ class FLOWERVLA(pl.LightningModule):
         self.optimizer_config = optimizer
         self.lr_scheduler_config = lr_scheduler
         self.optimizer_type = optimizer_type
+        
 
         if load_pretrained and pretrained_model_path is not None:
             self._load_pretrained_weights(pretrained_model_path)
@@ -242,6 +243,7 @@ class FLOWERVLA(pl.LightningModule):
         print(f"Loading Florence-2 from {vlm_path}")
         
         self.vlm = AutoModelForCausalLM.from_pretrained(vlm_path, trust_remote_code=True)
+        
         
         # Handle parameter freezing
         if freeze_florence:
@@ -622,10 +624,11 @@ class FLOWERVLA(pl.LightningModule):
         
         # Get token ID and create embedding
         prompt_token_id = self.tokenizer.convert_tokens_to_ids(prompt_text)
+        
         print("vlm device:", self.vlm.device)
         print("prompt device:", torch.tensor(prompt_token_id).device)
         prompt_embed = nn.Parameter(
-            self.vlm.get_input_embeddings()(torch.tensor(prompt_token_id)), 
+            self.vlm.get_input_embeddings()(torch.tensor(prompt_token_id, device=self.device)),
             requires_grad=False
         )
     
