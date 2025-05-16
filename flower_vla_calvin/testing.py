@@ -1,8 +1,8 @@
-from flower.models.flower import FLOWERVLA
+from flower_vla_calvin.flower.models.flower import FLOWERVLA
 import json
 from safetensors.torch import load_file
  
-from flower.models.flower import FLOWERVLA
+from flower_vla_calvin.flower.models.flower import FLOWERVLA
 
 with open("config.json", "r") as f:
     config = json.load(f)

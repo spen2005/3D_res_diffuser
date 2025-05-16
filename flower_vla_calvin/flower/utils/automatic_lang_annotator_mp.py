@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.nn import Linear
 
 import mode
-from flower.training import is_multi_gpu_training, log_rank_0
+from flower_vla_calvin.flower.training import is_multi_gpu_training, log_rank_0
 
 """This script will collect data snt store it with a fixed window size"""
 

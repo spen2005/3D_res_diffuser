@@ -15,7 +15,7 @@ from pytorch_lightning.utilities import rank_zero_only
 # This is for using the locally installed repo clone when using slurm
 sys.path.insert(0, Path(__file__).absolute().parents[1].as_posix())
 import flower.models.flower as models_m
-from flower.utils.utils import get_git_commit_hash, get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
+from flower_vla_calvin.flower.utils.utils import get_git_commit_hash, get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
 
 # Add local repo to path
 sys.path.insert(0, str(Path(__file__).absolute().parents[1]))

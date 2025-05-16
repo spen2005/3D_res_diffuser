@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 import torchvision
 
 import flower
-from flower.datasets.utils.episode_utils import load_dataset_statistics
+from flower_vla_calvin.flower.datasets.utils.episode_utils import load_dataset_statistics
 
 logger = logging.getLogger(__name__)
 DEFAULT_TRANSFORM = OmegaConf.create({"train": None, "val": None})

@@ -15,8 +15,8 @@ from libero.libero.benchmark import get_benchmark
 from libero.lifelong.datasets import (GroupedTaskDataset, SequenceVLDataset)
 from libero.lifelong.utils import (get_task_embs, safe_device, create_experiment_dir)
 
-from flower.datasets.utils.libero_utils import get_dataset
-from flower.datasets.utils.episode_utils import (
+from flower_vla_calvin.flower.datasets.utils.libero_utils import get_dataset
+from flower_vla_calvin.flower.datasets.utils.episode_utils import (
     get_state_info_dict,
     process_actions,
     process_depth,

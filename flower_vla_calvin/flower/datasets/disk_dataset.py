@@ -11,8 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import concurrent.futures
 import numpy as np
 
-from flower.datasets.base_dataset import BaseDataset
-from flower.datasets.utils.episode_utils import lookup_naming_pattern
+from flower_vla_calvin.flower.datasets.base_dataset import BaseDataset
+from flower_vla_calvin.flower.datasets.utils.episode_utils import lookup_naming_pattern
 
 logger = logging.getLogger(__name__)
 

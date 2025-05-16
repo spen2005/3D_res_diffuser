@@ -9,7 +9,7 @@ from operator import add
 
 import numpy as np
 
-from flower.evaluation.utils import temp_seed
+from flower_vla_calvin.flower.evaluation.utils import temp_seed
 
 logger = logging.getLogger(__name__)
 

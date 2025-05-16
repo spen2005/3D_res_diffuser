@@ -18,9 +18,9 @@ from tqdm.auto import tqdm
 import wandb
 import torch.distributed as dist
 
-from flower.evaluation.multistep_sequences import get_sequences
-from flower.evaluation.utils import get_default_mode_and_env, get_env_state_for_initial_condition, join_vis_lang
-from flower.rollout.rollout_video import RolloutVideo
+from flower_vla_calvin.flower.evaluation.multistep_sequences import get_sequences
+from flower_vla_calvin.flower.evaluation.utils import get_default_mode_and_env, get_env_state_for_initial_condition, join_vis_lang
+from flower_vla_calvin.flower.rollout.rollout_video import RolloutVideo
 
 logger = logging.getLogger(__name__)
 

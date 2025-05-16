@@ -10,9 +10,9 @@ from pytorch_lightning import Callback, LightningModule, Trainer
 import torch
 import torch.distributed as dist
 
-from flower.datasets.base_dataset import get_validation_window_size
-from flower.rollout.rollout_video import RolloutVideo
-from flower.utils.utils import get_portion_of_batch_ids
+from flower_vla_calvin.flower.datasets.base_dataset import get_validation_window_size
+from flower_vla_calvin.flower.rollout.rollout_video import RolloutVideo
+from flower_vla_calvin.flower.utils.utils import get_portion_of_batch_ids
 
 log_print = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ class Rollout(Callback):
             self.modalities = trainer.datamodule.modalities  # type: ignore
             self.device = pl_module.device
             dataset = trainer.val_dataloaders[0].dataset.datasets["vis"]  # type: ignore
-            from flower.rollout.rollout_long_horizon import RolloutLongHorizon
+            from flower_vla_calvin.flower.rollout.rollout_long_horizon import RolloutLongHorizon
 
             for callback in trainer.callbacks:
                 if isinstance(callback, RolloutLongHorizon) and callback.env is not None:

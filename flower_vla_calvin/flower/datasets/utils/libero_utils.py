@@ -1,7 +1,7 @@
 from copy import deepcopy
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
-from flower.datasets.robomimic_dataset import SequenceDataset
+from flower_vla_calvin.flower.datasets.robomimic_dataset import SequenceDataset
 
 """
     Helper function from Robomimic to read hdf5 demonstrations into sequence dataset

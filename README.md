@@ -12,4 +12,6 @@ conda install -c conda-forge libstdcxx-ng
 pip install -e .
 cd RL
 python envs/Genesis/train.py
+
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 ```

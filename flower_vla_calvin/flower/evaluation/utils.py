@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 import torch
 from hydra.core.global_hydra import GlobalHydra
 
-from flower.utils.utils import add_text, format_sftp_path
+from flower_vla_calvin.flower.utils.utils import add_text, format_sftp_path
 
 # hasher = pyhash.fnv1_32()
 logger = logging.getLogger(__name__)

@@ -14,8 +14,8 @@ from omegaconf import DictConfig
 from pytorch_lightning import Callback, LightningModule, Trainer
 from tqdm import tqdm
 
-from flower.datasets.shm_dataset import ShmDataset
-from flower.datasets.utils.episode_utils import lookup_naming_pattern
+from flower_vla_calvin.flower.datasets.shm_dataset import ShmDataset
+from flower_vla_calvin.flower.datasets.utils.episode_utils import lookup_naming_pattern
 
 log = logging.getLogger(__name__)
 

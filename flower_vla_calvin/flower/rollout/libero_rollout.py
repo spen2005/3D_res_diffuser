@@ -27,9 +27,9 @@ from libero.lifelong.utils import (get_task_embs, safe_device, create_experiment
 # import sys
 # sys.path.insert(0, Path(__file__).absolute().parents[2].as_posix())
 
-from flower.evaluation.multistep_sequences import get_sequences
-from flower.evaluation.utils import get_env_state_for_initial_condition, join_vis_lang, LangEmbeddings
-from flower.rollout.rollout_video import RolloutVideo
+from flower_vla_calvin.flower.evaluation.multistep_sequences import get_sequences
+from flower_vla_calvin.flower.evaluation.utils import get_env_state_for_initial_condition, join_vis_lang, LangEmbeddings
+from flower_vla_calvin.flower.rollout.rollout_video import RolloutVideo
 from typing import Any, Dict, Tuple, Union
 
 
@@ -434,7 +434,7 @@ if __name__ == "__main__":
     import omegaconf
     os.environ.CUDA_VISIBLE_DEVICES = '5'
 
-    from flower.evaluation.utils import load_pl_module_from_checkpoint
+    from flower_vla_calvin.flower.evaluation.utils import load_pl_module_from_checkpoint
 
     transform_cfg = omegaconf.OmegaConf.load("/home/yagmurlu/code/MoDE_Calvin/conf/datamodule/transforms/libero_transforms.yaml")
     transforms = transform_cfg['val']

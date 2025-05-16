@@ -19,7 +19,7 @@ import wandb
 from timm.layers.mlp import Mlp
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
 
-from flower.models.networks.transformers import (
+from flower_vla_calvin.flower.models.networks.transformers import (
     TimestepEmbedder,
     SharedAdaLNController,
     RmsNorm,
@@ -29,9 +29,9 @@ from flower.models.networks.transformers import (
     FlowBlock, 
     stateless_norm
 )
-from flower.utils.lr_schedulers.tri_stage_scheduler import TriStageLRScheduler
-from flower.callbacks.ema import EMA
-from flower.models.utils import ActionIndex, generate_policy_prompt
+from flower_vla_calvin.flower.utils.lr_schedulers.tri_stage_scheduler import TriStageLRScheduler
+from flower_vla_calvin.flower.callbacks.ema import EMA
+from flower_vla_calvin.flower.models.utils import ActionIndex, generate_policy_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -622,6 +622,8 @@ class FLOWERVLA(pl.LightningModule):
         
         # Get token ID and create embedding
         prompt_token_id = self.tokenizer.convert_tokens_to_ids(prompt_text)
+        print("vlm device:", self.vlm.device)
+        print("prompt device:", torch.tensor(prompt_token_id).device)
         prompt_embed = nn.Parameter(
             self.vlm.get_input_embeddings()(torch.tensor(prompt_token_id)), 
             requires_grad=False

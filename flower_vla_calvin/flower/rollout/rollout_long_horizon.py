@@ -13,9 +13,9 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
-from flower.evaluation.multistep_sequences import get_sequences
-from flower.evaluation.utils import get_env_state_for_initial_condition, join_vis_lang, LangEmbeddings
-from flower.rollout.rollout_video import RolloutVideo
+from flower_vla_calvin.flower.evaluation.multistep_sequences import get_sequences
+from flower_vla_calvin.flower.evaluation.utils import get_env_state_for_initial_condition, join_vis_lang, LangEmbeddings
+from flower_vla_calvin.flower.rollout.rollout_video import RolloutVideo
 
 log_print = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class RolloutLongHorizon(Callback):
                 dataset = dataloader.dataset
                 
                 # Initialize environment
-                from flower.rollout.rollout import Rollout
+                from flower_vla_calvin.flower.rollout.rollout import Rollout
                 for callback in trainer.callbacks:
                     if isinstance(callback, Rollout) and callback.env is not None:
                         self.env = callback.env

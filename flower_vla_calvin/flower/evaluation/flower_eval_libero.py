@@ -35,14 +35,14 @@ from libero.lifelong.metric import evaluate_multitask_training_success, raw_obs_
 from libero.lifelong.utils import create_experiment_dir, get_task_embs, safe_device
 
 # Local project imports
-from flower.evaluation.multistep_sequences import get_sequences
-from flower.evaluation.utils import (
+from flower_vla_calvin.flower.evaluation.multistep_sequences import get_sequences
+from flower_vla_calvin.flower.evaluation.utils import (
     LangEmbeddings,
     get_default_mode_and_env,
     get_env_state_for_initial_condition,
     join_vis_lang,
 )
-from flower.rollout.rollout_video import RolloutVideo
+from flower_vla_calvin.flower.rollout.rollout_video import RolloutVideo
 
 logger = logging.getLogger(__name__)
 

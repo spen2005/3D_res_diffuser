@@ -8,7 +8,7 @@ import torch
 
 from calvin_env.envs.play_table_env import get_env
 from calvin_env.utils.utils import EglDeviceNotFoundError, get_egl_device_id
-from flower.datasets.utils.episode_utils import process_depth, process_rgb, process_state
+from flower_vla_calvin.flower.datasets.utils.episode_utils import process_depth, process_rgb, process_state
 
 logger = logging.getLogger(__name__)
 

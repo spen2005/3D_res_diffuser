@@ -13,7 +13,7 @@ import wandb
 import wandb.util
 from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
-from flower.utils.utils import add_text
+from flower_vla_calvin.flower.utils.utils import add_text
 
 log = logging.getLogger(__name__)
 
