@@ -9,11 +9,7 @@
 conda create -n resrl python=3.10
 pip install -r requirements.txt
 conda install -c conda-forge libstdcxx-ng
-cd RL
 pip install -e .
+cd RL
 python envs/Genesis/train.py
-cd ..
-cd flower_vla_calvin
-python testing.py
-cd ..
 ```
