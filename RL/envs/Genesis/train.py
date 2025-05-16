@@ -7,7 +7,7 @@ from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import numpy as np
 
-from algos.ppo import PPO
+from RL.algos.ppo import PPO
 
 from vecenv import VecEnv
 
@@ -175,10 +175,12 @@ class MyEnv(VecEnv):
         # Load right robot URDF
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
-                file="/mnt/home/spen2005/Desktop/3D_res_diffuser/RL/assets/panda_bullet/panda.urdf",
+                file="./assets/panda_bullet/panda.urdf",
                 pos = (0, -0.4, 0),
                 fixed=True,
-                merge_fixed_links=True
+                merge_fixed_links=True,
+                convexify=True,
+                decompose_robot_error_threshold=float("inf"),
             )
         )
         self.table = self.scene.add_entity(
@@ -186,6 +188,26 @@ class MyEnv(VecEnv):
                 pos = (0, 0.9, 0.3),
                 size = (1.5, 1.5, 0.6),
                 fixed = True,
+            ),
+            surface=gs.surfaces.Plastic(color=(0, 0, 0))
+        )
+        self.cube = self.scene.add_entity(
+            gs.morphs.Box(
+                pos = (0, 0.22, 0.62),
+                size = (0.04, 0.04, 0.04),
+                fixed = False,
+            ),
+            surface=gs.surfaces.Plastic(color=(1.0, 0, 0))
+        )
+        self.bowl = self.scene.add_entity(
+            gs.morphs.URDF(
+                pos = (-0.2, 0.22, 0.7),
+                file="./assets/C12001/C12001.urdf",
+                fixed=False, 
+                convexify=True,
+                coacd_options=gs.options.CoacdOptions(
+                        threshold=0.05,
+                ),
             )
         )
     
@@ -228,6 +250,23 @@ class MyEnv(VecEnv):
     
 
 if __name__ == "__main__":
+
+    from flower_vla_calvin.flower.models.flower import FLOWERVLA
+    import json
+    from safetensors.torch import load_file
+    
+    from flower_vla_calvin.flower.models.flower import FLOWERVLA
+
+    with open("config.json", "r") as f:
+        config = json.load(f)
+
+    base_model = FLOWERVLA(**config["model_config"], load_pretrained = True, pretrained_model_path="model.safetensors")
+    # state_dict = load_file("model.safetensors")
+    # print(state_dict.keys())
+    # model.load_state_dict(state_dict)
+    base_model = base_model.cuda()
+    base_model.eval()
+    print("done loading")
 
     observation_space = spaces.Dict({
             'image': spaces.Box(

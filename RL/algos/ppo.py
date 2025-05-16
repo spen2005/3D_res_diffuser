@@ -16,7 +16,7 @@ from stable_baselines3.common.save_util import load_from_zip_file, recursive_get
 from stable_baselines3.common.vec_env.patch_gym import _convert_space, _patch_env
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 # from rl_library.policies import ActorCriticPolicy
-from algos.policies import ActorCriticPolicy
+from RL.algos.policies import ActorCriticPolicy
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
 

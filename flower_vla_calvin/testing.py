@@ -1,5 +1,4 @@
 from flower.models.flower import FLOWERVLA
-from flower.evaluation.utils import load_mode_from_safetensor
 import json
 from safetensors.torch import load_file
  
