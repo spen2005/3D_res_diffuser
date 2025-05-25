@@ -93,6 +93,8 @@ class MyEnv(VecEnv):
     
     def __init__(
         self, 
+        model,
+        instruction,
         observation_space,
         action_space,
         bottle_pos = (-0.24, 0.2786, 0.63),
@@ -106,6 +108,8 @@ class MyEnv(VecEnv):
         spacing = (0, 0),
         GUI = False
     ):
+        self.model = model
+        self.instruction = instruction
         self.observation_space = observation_space
         self.action_space = action_space
         self.bottle_pos = bottle_pos
@@ -115,6 +119,7 @@ class MyEnv(VecEnv):
         self.robot.set_dofs_kp(np.array([5000]*9)) 
         self.robot.set_dofs_kv(np.array([500]*9))
 
+        self.base_action = torch.zeros((n_envs, 7), device=gs.device)
         self.traj_idxs = [0 for _ in range(n_envs)]
         self.accum_xyz_r = torch.zeros((n_envs, 3), device=gs.device)
         self.accum_xyz_l = torch.zeros((n_envs, 3), device=gs.device)
@@ -128,6 +133,7 @@ class MyEnv(VecEnv):
         return self._get_obs()
 
     def step(self, actions):
+        actions = actions + self.base_action
 
         for i in range(self.n_envs):
             self.traj_idxs[i] += 1
@@ -147,8 +153,8 @@ class MyEnv(VecEnv):
 
         # Extra step to get the transitions
         qpos = self.robot.inverse_kinematics(
-            pos = np.random.uniform(0.5, 1, (self.n_envs, 3)),
-            quat = np.tile([1, 0, 0, 0], (self.n_envs, 1)),
+            pos = actions[:, :3],
+            quat = actions[:, [1,2,3,0]],  # Assuming actions are in [x, y, z, qx, qy, qz, qw] format
             max_samples = 20,
             init_qpos = self.robot.get_dofs_position().contiguous(),
             link = self.robot.get_link("panda_link7"),
@@ -168,8 +174,24 @@ class MyEnv(VecEnv):
             return
         for idx in envs_idx:
             self.traj_idxs[idx] = 0
+            self.base_action[idx] = torch.zeros(7, device=gs.device)
             
         return
+    
+    def _get_base_actions(self, images):
+        # Get the base actions from the model
+        with torch.no_grad():
+            for i in range(self.n_envs):
+                rgb_static_cam = images[i]
+                obs = {
+                    "rgb_obs": {
+                        "rgb_static": rgb_static_cam,
+                        # "rgb_gripper": rgb_gripper_cam
+                    }
+                }
+                goal = {"lang_text": self.instruction}
+                action = self.model.step(obs, goal)
+                self.base_action[i] = action
 
     def _add_entity(self):
         # Load right robot URDF
@@ -216,16 +238,26 @@ class MyEnv(VecEnv):
         start = time.time()
         images = self.cam.render()[0]
         images = np.float32(images)
-        images = torch.tensor(images, device=gs.device)
+        # images = torch.tensor(images, device=gs.device)
+        images = torch.tensor(images, dtype=torch.float32, device=gs.device)
+
 
         proprioception = []
         for i in range(self.n_envs):
-            proprioception.append(torch.zeros(9))
+            proprioception.append(torch.zeros(7))
         proprioception = torch.stack(proprioception)
+
+        self._get_base_actions(images)
 
         state = {
             'image': images,
-            'proprioception': proprioception
+            'proprioception': 
+                torch.concat([
+                        proprioception,
+                        self.base_action,
+                    ],
+                    dim=1
+                )
         }
         return state
 
@@ -278,14 +310,14 @@ if __name__ == "__main__":
             'proprioception': spaces.Box(
                 low=-np.inf,
                 high=np.inf,
-                shape=(9,),
+                shape=(14,),
                 dtype=np.float32
             )
     })
     
-    action_space = spaces.Box(low=-1, high=1, shape=(9,), dtype=np.float32)
+    action_space = spaces.Box(low=-1, high=1, shape=(7,), dtype=np.float32)
 
-    env = MyEnv(observation_space, action_space, show_viewer=True, n_envs=4)
+    env = MyEnv(base_model, observation_space, action_space, show_viewer=True, n_envs=4)
 
     policy_kwargs = {
         "features_extractor_class": CustomCombinedExtractor,
