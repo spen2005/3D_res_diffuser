@@ -1,0 +1,76 @@
+# Base Configuration for Single-Task PPO Training
+
+seed: 42
+total_timesteps: 40_000_000
+
+simulator:
+  backend: "gpu" # Or "cpu"
+  # logging_level: "warning"
+  # context_options: # Optional genesis.Context settings
+  #   gpu: 0
+  #   cuda_graphics: False
+  #   offscreen: True
+
+environment:
+  n_envs_total: 1024
+  # envs_per_task: null # null means distribute evenly, or specify list like [512, 512]
+  show_viewer: False
+  # Observation/Action space definitions (can be complex to fully define in YAML)
+  # Option 1: Define key parameters, construct spaces in code
+  observation_space:
+    image_shape: [64, 64, 3]
+    proprioception_shape: [15]
+
+  action_space:
+    # Using fixed limits derived from xyz_limit and joint_limit in tasks
+    # Or define bounds directly if consistent across tasks
+    shape: [50]
+    # action_scale will be calculated based on task limits
+  action_scale_coeffs: # Coefficients to multiply task limits by
+    xyz: 800
+    joint: 100
+    xyz_limit: 0.00
+    joint_limit: 0.00
+
+  cam_pos: [0, 0.3, 1.6]
+  cam_lookat: [0, 0.47, 0.7]
+  friction: 4.5
+  robot_config: "configs/humanoids/g1_shadow.yaml" # Path to robot config
+
+tasks: # List the names of tasks to run (correspond to file names in configs/tasks/)
+  # - BallPicking1
+  # - BallPicking2
+  # - BottleLifting1
+  # - BottleLifting2
+  - BowlLifting1
+
+task_configs_path: 
+  - "./configs/tasks/muck1.yaml" # Path to task config file
+
+policy:
+  name: "ActorCriticPolicy" # Or your custom policy name if applicable
+  features_extractor_class: "CNN_Extractor" # Name of your class
+  features_extractor_kwargs: {}
+  net_arch:
+    pi: [64, 64]
+    vf: [64, 64]
+
+algorithm:
+  name: "PPO" # Or "MultiTaskPPO"
+  learning_rate: 3.0e-4
+  n_steps: 128
+  batch_size: 1024
+  gamma: 0.99
+  gae_lambda: 0.95
+  verbose: 1
+  # Add other PPO params as needed (clip_range, ent_coef, vf_coef, ...)
+
+logging:
+  logdir: "training_runs" # Base directory for all runs
+  run_name_prefix: "multitask_run"
+  # WandB specific settings
+  wandb:
+    project: "oakink" # Your W&B project name
+    entity: null # Your W&B entity (username or team), null uses default
+    sync_tensorboard: True
+    save_freq: 128 # Frequency for WandbCallback model saving

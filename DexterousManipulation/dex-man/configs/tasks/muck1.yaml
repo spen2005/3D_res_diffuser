@@ -1,0 +1,14 @@
+class_name: "ManipTask"
+task_id: 6
+params:
+  robot_traj_path: '/mnt/tank/dex-man/data/hand_obj_track/oakink_83207/robot_traj1.npy'
+  obj_traj_path: '/mnt/tank/dex-man/data/hand_obj_track/oakink_83207/obj_traj1.joblib'
+  obj_pos_diff_tolerance: 6
+  obj_rot_diff_tolerance: 15707963267948966
+  start_idx: 525
+  end_idx: 840
+  friction: 4.5
+  obj_keys: ['S10001',  'O02@0038@00001']
+  translation: [0.0, 0.0, 0.000]
+  table_pos: [0, 1.2, 0.4982]
+
