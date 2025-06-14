@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<robot name="design">
+  <material name="obj_color">
+      <color rgba="0.2 0.3 0.5 1.0"/>
+  </material>
+  <link name="base">
+    <visual>
+      <origin xyz="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="mug.obj" scale="1 1 1"/>
+      </geometry>
+      <material name="obj_color"/>
+    </visual>
+    <collision>
+      <origin xyz="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="mug.obj" scale="1 1 1"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>
