@@ -1,7 +1,7 @@
 # Base Configuration for Single-Task PPO Training
 
 seed: 42
-total_timesteps: 40_000_000
+total_timesteps: 400_000_000
 
 simulator:
   backend: "gpu" # Or "cpu"
