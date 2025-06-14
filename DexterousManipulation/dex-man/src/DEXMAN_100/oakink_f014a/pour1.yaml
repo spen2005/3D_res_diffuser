@@ -1,0 +1,11 @@
+class_name: "ManipTask"
+task_id: 6
+params:
+  robot_traj_path: './src/DEXMAN_100/oakink_f014a/robot_traj1.npy'
+  obj_traj_path: './src/DEXMAN_100/oakink_f014a/obj_traj1.pickle'
+  obj_pos_diff_tolerance: 0.06
+  obj_rot_diff_tolerance: 1.57
+  start_idx: 450
+  end_idx: 920
+  friction: 4.5
+  obj_keys: ['O02@0015@00002']
